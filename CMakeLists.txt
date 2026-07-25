@@ -608,6 +608,7 @@ if(LIBUV_BUILD_TESTS)
        test/test-pipe-pending-instances.c
        test/test-pipe-sendmsg.c
        test/test-pipe-server-close.c
+       test/test-pipe-server-transfer.c
        test/test-pipe-set-fchmod.c
        test/test-pipe-set-non-blocking.c
        test/test-pipe-write.c

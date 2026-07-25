@@ -444,6 +444,18 @@ static DWORD uv__pipe_attach_iocp(HANDLE pipeHandle,
 }
 
 
+/* Perform a deferred IOCP association for a pipe connection before its first
+ * overlapped operation is issued. Sets compatibility flags internally if the
+ * association fails (because some other loop or process is already
+ * associated with the file object). */
+static void uv__pipe_ensure_iocp(uv_pipe_t* handle) {
+  if (!(handle->flags & UV_HANDLE_PIPE_LAZY_IOCP))
+    return;
+  handle->flags &= ~UV_HANDLE_PIPE_LAZY_IOCP;
+  uv__pipe_attach_iocp(handle->handle, handle->loop->iocp, handle);
+}
+
+
 int uv__create_stdio_pipe_pair(uv_loop_t* loop,
     uv_pipe_t* parent_pipe, HANDLE* child_pipe_ptr, unsigned int flags) {
   /* The parent_pipe is always the server_pipe and kept by libuv.
@@ -509,8 +521,7 @@ int uv__create_stdio_pipe_pair(uv_loop_t* loop,
 }
 
 
-static int uv__set_pipe_handle(uv_loop_t* loop,
-                               uv_pipe_t* handle,
+static int uv__set_pipe_handle(uv_pipe_t* handle,
                                HANDLE pipeHandle,
                                int fd,
                                DWORD duplex_flags) {
@@ -572,10 +583,10 @@ static int uv__set_pipe_handle(uv_loop_t* loop,
     handle->pipe.conn.writefile_thread_handle = INVALID_HANDLE_VALUE;
     InitializeCriticalSection(&handle->pipe.conn.thread_lock);
   } else {
-    /* Overlapped pipe. Try to associate with IOCP.
-     * Will set compatibility flags internally if this fails
-     * (because some other process already has activated IOCP). */
-    uv__pipe_attach_iocp(pipeHandle, loop->iocp, handle);
+    /* Overlapped pipe. IOCP association is deferred to the first read or
+     * write, so an unused connection can still be transferred to another
+     * loop with uv_pipe_open(). */
+    handle->flags |= UV_HANDLE_PIPE_LAZY_IOCP;
   }
 
   handle->handle = pipeHandle;
@@ -586,10 +597,8 @@ static int uv__set_pipe_handle(uv_loop_t* loop,
 }
 
 
-static int pipe_alloc_accept(uv_loop_t* loop, uv_pipe_t* handle,
+static int pipe_alloc_accept(uv_pipe_t* handle,
                              uv_pipe_accept_t* req, BOOL firstInstance) {
-  DWORD err;
-
   assert(req->pipeHandle == INVALID_HANDLE_VALUE);
 
   req->pipeHandle =
@@ -603,10 +612,10 @@ static int pipe_alloc_accept(uv_loop_t* loop, uv_pipe_t* handle,
     return 0;
   }
 
-  /* Associate it with IOCP so we can get events. */
-  err = uv__pipe_attach_iocp(req->pipeHandle, loop->iocp, handle);
-  if (err)
-    uv_fatal_error(err, "uv__pipe_attach_iocp");
+  /* IOCP association is deferred to uv__pipe_queue_accept() so that a bound
+   * instance carries no loop association and remains transferable to another
+   * loop via uv_pipe_open(). */
+  req->iocp_associated = 0;
 
   /* Stash a handle in the server object for use from places such as
    * getsockname and chmod. As we transfer ownership of these to client
@@ -757,7 +766,6 @@ int uv_pipe_bind2(uv_pipe_t* handle,
                   const char* name,
                   size_t namelen,
                   unsigned int flags) {
-  uv_loop_t* loop = handle->loop;
   int i, err;
   uv_pipe_accept_t* req;
   char* name_copy;
@@ -810,6 +818,7 @@ int uv_pipe_bind2(uv_pipe_t* handle,
     UV_REQ_INIT(req, UV_ACCEPT);
     req->data = handle;
     req->pipeHandle = INVALID_HANDLE_VALUE;
+    req->iocp_associated = 0;
     req->next_pending = NULL;
   }
 
@@ -826,8 +835,7 @@ int uv_pipe_bind2(uv_pipe_t* handle,
    * Attempt to create the first pipe with FILE_FLAG_FIRST_PIPE_INSTANCE.
    * If this fails then there's already a pipe server for the given pipe name.
    */
-  if (!pipe_alloc_accept(loop,
-                         handle,
+  if (!pipe_alloc_accept(handle,
                          &handle->pipe.serv.accept_reqs[0],
                          TRUE)) {
     err = GetLastError();
@@ -1285,10 +1293,11 @@ void uv__pipe_close(uv_loop_t* loop, uv_pipe_t* handle) {
 static void uv__pipe_queue_accept(uv_loop_t* loop, uv_pipe_t* handle,
     uv_pipe_accept_t* req, BOOL firstInstance) {
   BOOL success;
+  DWORD err;
 
   assert(handle->flags & UV_HANDLE_LISTENING);
 
-  if (!firstInstance && !pipe_alloc_accept(loop, handle, req, FALSE)) {
+  if (!firstInstance && !pipe_alloc_accept(handle, req, FALSE)) {
     SET_REQ_ERROR(req, GetLastError());
     uv__insert_pending_req(loop, (uv_req_t*) req);
     handle->reqs_pending++;
@@ -1296,6 +1305,15 @@ static void uv__pipe_queue_accept(uv_loop_t* loop, uv_pipe_t* handle,
   }
 
   assert(req->pipeHandle != INVALID_HANDLE_VALUE);
+
+  /* Associate the instance with the loop's IOCP, exactly once per instance,
+   * before the first overlapped operation is issued on it. */
+  if (!req->iocp_associated) {
+    err = uv__pipe_attach_iocp(req->pipeHandle, loop->iocp, handle);
+    if (err)
+      uv_fatal_error(err, "uv__pipe_attach_iocp");
+    req->iocp_associated = 1;
+  }
 
   /* Prepare the overlapped structure. */
   memset(&(req->u.io.overlapped), 0, sizeof(req->u.io.overlapped));
@@ -1665,6 +1683,8 @@ int uv__pipe_read_start(uv_pipe_t* handle,
                         uv_alloc_cb alloc_cb,
                         uv_read_cb read_cb) {
   uv_loop_t* loop = handle->loop;
+
+  uv__pipe_ensure_iocp(handle);
 
   handle->flags |= UV_HANDLE_READING;
   INCREASE_ACTIVE_COUNT(loop, handle);
@@ -2048,6 +2068,8 @@ int uv__pipe_write(uv_loop_t* loop,
                    size_t nbufs,
                    uv_stream_t* send_handle,
                    uv_write_cb cb) {
+  uv__pipe_ensure_iocp(handle);
+
   if (handle->ipc) {
     /* IPC pipe write: use framing protocol. */
     return uv__pipe_write_ipc(loop, req, handle, bufs, nbufs, send_handle, cb);
@@ -2485,7 +2507,7 @@ void uv__process_pipe_connect_req(uv_loop_t* loop, uv_pipe_t* handle,
     if (handle->flags & UV_HANDLE_CLOSING)
       err = UV_ECANCELED;
     else
-      err = uv__set_pipe_handle(loop, handle, pipeHandle, -1, duplex_flags);
+      err = uv__set_pipe_handle(handle, pipeHandle, -1, duplex_flags);
     if (err)
       CloseHandle(pipeHandle);
   } else {
@@ -2627,12 +2649,148 @@ static void eof_timer_close_cb(uv_handle_t* handle) {
 }
 
 
+/* Adopt a named pipe server-end instance that has not been connected yet
+ * (e.g. a bound instance duplicated from another loop) as a bound pipe
+ * server, so it can be passed to uv_listen(). */
+static int uv__pipe_adopt_server(uv_pipe_t* pipe, HANDLE os_handle, int file) {
+  static const WCHAR pipe_prefix_w[] = L"\\\\?\\pipe";
+  const size_t pipe_prefix_w_len = ARRAY_SIZE(pipe_prefix_w) - 1;
+  NTSTATUS nt_status;
+  IO_STATUS_BLOCK io_status;
+  FILE_NAME_INFORMATION tmp_name_info;
+  FILE_NAME_INFORMATION* name_info;
+  uv_pipe_accept_t* req;
+  HANDLE pipeHandle;
+  WCHAR* name;
+  WCHAR* name_buf;
+  unsigned int name_len;
+  unsigned int name_size;
+  DWORD err;
+  int i;
+
+  /* Recover the pipe name so that additional instances can be created when
+   * accepting connections. */
+  name_info = NULL;
+  nt_status = pNtQueryInformationFile(os_handle,
+                                      &io_status,
+                                      &tmp_name_info,
+                                      sizeof tmp_name_info,
+                                      FileNameInformation);
+  if (nt_status == STATUS_BUFFER_OVERFLOW) {
+    name_size = sizeof(*name_info) + tmp_name_info.FileNameLength;
+    name_info = uv__malloc(name_size);
+    if (name_info == NULL)
+      return UV_ENOMEM;
+
+    nt_status = pNtQueryInformationFile(os_handle,
+                                        &io_status,
+                                        name_info,
+                                        name_size,
+                                        FileNameInformation);
+  }
+
+  if (nt_status != STATUS_SUCCESS) {
+    uv__free(name_info);
+    return uv_translate_sys_error(pRtlNtStatusToDosError(nt_status));
+  }
+
+  if (name_info == NULL) {
+    name_buf = tmp_name_info.FileName;
+    name_len = tmp_name_info.FileNameLength / sizeof(WCHAR);
+  } else {
+    name_buf = name_info->FileName;
+    name_len = name_info->FileNameLength / sizeof(WCHAR);
+  }
+
+  if (name_len == 0) {
+    uv__free(name_info);
+    return UV_EINVAL;
+  }
+
+  /* The returned name is relative to the named pipe device, e.g. "\foo". */
+  name = uv__malloc((pipe_prefix_w_len + name_len + 1) * sizeof(WCHAR));
+  if (name == NULL) {
+    uv__free(name_info);
+    return UV_ENOMEM;
+  }
+  memcpy(name, pipe_prefix_w, pipe_prefix_w_len * sizeof(WCHAR));
+  memcpy(name + pipe_prefix_w_len, name_buf, name_len * sizeof(WCHAR));
+  name[pipe_prefix_w_len + name_len] = L'\0';
+  uv__free(name_info);
+
+  /* Take a reference of our own: ownership of the instance handle transfers
+   * to the accepted connection, so it must not stay tied to the CRT fd. */
+  if (file != -1) {
+    if (!DuplicateHandle(GetCurrentProcess(),
+                         os_handle,
+                         GetCurrentProcess(),
+                         &pipeHandle,
+                         0,
+                         FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+      uv__free(name);
+      return uv_translate_sys_error(GetLastError());
+    }
+  } else {
+    /* Already duplicated by the caller. */
+    pipeHandle = os_handle;
+  }
+
+  /* Associate with this loop's IOCP now: the adopting loop is final, and an
+   * instance whose file object is already associated elsewhere (e.g. a
+   * disconnected instance from a listened-on server) fails gracefully here
+   * rather than fatally at listen time. */
+  err = uv__pipe_attach_iocp(pipeHandle, pipe->loop->iocp, pipe);
+  if (err) {
+    pipe->flags &= ~UV_HANDLE_EMULATE_IOCP;
+    if (file != -1)
+      CloseHandle(pipeHandle);
+    uv__free(name);
+    return uv_translate_sys_error(err);
+  }
+
+  pipe->pipe.serv.pending_instances = default_pending_pipe_instances;
+
+  pipe->pipe.serv.accept_reqs = (uv_pipe_accept_t*)
+    uv__malloc(sizeof(uv_pipe_accept_t) * pipe->pipe.serv.pending_instances);
+  if (pipe->pipe.serv.accept_reqs == NULL) {
+    if (file != -1)
+      CloseHandle(pipeHandle);
+    uv__free(name);
+    return UV_ENOMEM;
+  }
+
+  for (i = 0; i < pipe->pipe.serv.pending_instances; i++) {
+    req = &pipe->pipe.serv.accept_reqs[i];
+    UV_REQ_INIT(req, UV_ACCEPT);
+    req->data = pipe;
+    req->pipeHandle = INVALID_HANDLE_VALUE;
+    req->iocp_associated = 0;
+    req->next_pending = NULL;
+  }
+
+  pipe->pipe.serv.accept_reqs[0].pipeHandle = pipeHandle;
+  pipe->pipe.serv.accept_reqs[0].iocp_associated = 1;
+  pipe->handle = pipeHandle;
+  pipe->name = name;
+  pipe->pipe.serv.pending_accepts = NULL;
+  pipe->flags |= UV_HANDLE_PIPESERVER;
+  pipe->flags |= UV_HANDLE_BOUND;
+
+  if (file != -1)
+    _close(file);
+
+  return 0;
+}
+
+
 int uv_pipe_open(uv_pipe_t* pipe, uv_file file) {
   HANDLE os_handle = uv__get_osfhandle(file);
   NTSTATUS nt_status;
   IO_STATUS_BLOCK io_status;
   FILE_ACCESS_INFORMATION access;
   DWORD duplex_flags = 0;
+  DWORD pipe_flags;
   int err;
 
   if (os_handle == INVALID_HANDLE_VALUE)
@@ -2642,7 +2800,6 @@ int uv_pipe_open(uv_pipe_t* pipe, uv_file file) {
   if (pipe->flags & UV_HANDLE_CONNECTION)
     return UV_EBUSY;
 
-  uv__pipe_connection_init(pipe);
   uv__once_init();
   /* In order to avoid closing a stdio file descriptor 0-2, duplicate the
    * underlying OS handle and forget about the original fd.
@@ -2662,6 +2819,44 @@ int uv_pipe_open(uv_pipe_t* pipe, uv_file file) {
     assert(os_handle != INVALID_HANDLE_VALUE);
     file = -1;
   }
+
+  /* An overlapped server end that has not been connected is adopted as a
+   * bound pipe server. Connected server ends (this includes the server sides
+   * of uv_pipe() and stdio pairs) are opened as stream connections below. */
+  if (!pipe->ipc &&
+      GetNamedPipeInfo(os_handle, &pipe_flags, NULL, NULL, NULL) &&
+      pipe_flags & PIPE_SERVER_END) {
+    FILE_PIPE_LOCAL_INFORMATION pipe_info;
+    FILE_MODE_INFORMATION mode_info;
+
+    nt_status = pNtQueryInformationFile(os_handle,
+                                        &io_status,
+                                        &pipe_info,
+                                        sizeof pipe_info,
+                                        FilePipeLocalInformation);
+    if (nt_status != STATUS_SUCCESS)
+      return UV_EINVAL;
+
+    if (pipe_info.NamedPipeState == FILE_PIPE_DISCONNECTED_STATE) {
+      nt_status = pNtQueryInformationFile(os_handle,
+                                          &io_status,
+                                          &mode_info,
+                                          sizeof mode_info,
+                                          FileModeInformation);
+      if (nt_status != STATUS_SUCCESS)
+        return UV_EINVAL;
+
+      if (!(mode_info.Mode & (FILE_SYNCHRONOUS_IO_ALERT |
+                              FILE_SYNCHRONOUS_IO_NONALERT))) {
+        err = uv__pipe_adopt_server(pipe, os_handle, file);
+        if (err != 0 && file == -1)
+          CloseHandle(os_handle);
+        return err;
+      }
+    }
+  }
+
+  uv__pipe_connection_init(pipe);
 
   /* Determine what kind of permissions we have on this handle.
    * Cygwin opens the pipe in message mode, but we can support it,
@@ -2687,11 +2882,7 @@ int uv_pipe_open(uv_pipe_t* pipe, uv_file file) {
   if (access.AccessFlags & FILE_READ_DATA)
     duplex_flags |= UV_HANDLE_READABLE;
 
-  err = uv__set_pipe_handle(pipe->loop,
-                            pipe,
-                            os_handle,
-                            file,
-                            duplex_flags);
+  err = uv__set_pipe_handle(pipe, os_handle, file, duplex_flags);
   if (err) {
     if (file == -1)
       CloseHandle(os_handle);

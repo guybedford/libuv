@@ -410,6 +410,7 @@ struct uv__req_write_extra_s {
   typedef struct uv_pipe_accept_s {                                           \
     UV_REQ_FIELDS                                                             \
     HANDLE pipeHandle;                                                        \
+    int iocp_associated;                                                      \
     struct uv_pipe_accept_s* next_pending;                                    \
   } uv_pipe_accept_t;                                                         \
                                                                               \

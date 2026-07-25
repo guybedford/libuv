@@ -47,6 +47,15 @@ API
 
     .. versionchanged:: 1.2.1 the file descriptor is set to non-blocking mode.
 
+    .. versionchanged:: 1.53.0 on Windows, the server end of a named pipe
+                        instance that has not yet been connected is adopted
+                        as a bound server handle that can be passed to
+                        :c:func:`uv_listen`, matching the existing behavior
+                        for bound Unix domain socket fds. In addition, IOCP
+                        association of pipe connections is deferred to the
+                        first read or write, so a connection that has not
+                        performed any I/O can be re-opened on another loop.
+
     .. note::
         The passed file descriptor or HANDLE is not checked for its type, but
         it's required that it represents a valid pipe.

@@ -229,6 +229,7 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-pipe-pending-instances.c \
                          test/test-pipe-sendmsg.c \
                          test/test-pipe-server-close.c \
+                         test/test-pipe-server-transfer.c \
                          test/test-pipe-close-stdout-read-stdin.c \
                          test/test-pipe-set-non-blocking.c \
                          test/test-pipe-set-fchmod.c \

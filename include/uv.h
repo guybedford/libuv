@@ -1493,6 +1493,8 @@ UV_EXTERN int uv_fs_open(uv_loop_t* loop,
                          int flags,
                          int mode,
                          uv_fs_cb cb);
+#define UV_FS_AT_SYMLINK_NOFOLLOW 0x0001
+#define UV_FS_AT_REMOVEDIR        0x0002
 UV_EXTERN int uv_fs_openat(uv_loop_t* loop,
                            uv_fs_t* req,
                            uv_file dirfd,
@@ -1511,6 +1513,12 @@ UV_EXTERN int uv_fs_unlink(uv_loop_t* loop,
                            uv_fs_t* req,
                            const char* path,
                            uv_fs_cb cb);
+UV_EXTERN int uv_fs_unlinkat(uv_loop_t* loop,
+                             uv_fs_t* req,
+                             uv_file dirfd,
+                             const char* path,
+                             int flags,
+                             uv_fs_cb cb);
 UV_EXTERN int uv_fs_write(uv_loop_t* loop,
                           uv_fs_t* req,
                           uv_file file,
@@ -1547,6 +1555,12 @@ UV_EXTERN int uv_fs_mkdir(uv_loop_t* loop,
                           const char* path,
                           int mode,
                           uv_fs_cb cb);
+UV_EXTERN int uv_fs_mkdirat(uv_loop_t* loop,
+                            uv_fs_t* req,
+                            uv_file dirfd,
+                            const char* path,
+                            int mode,
+                            uv_fs_cb cb);
 UV_EXTERN int uv_fs_mkdtemp(uv_loop_t* loop,
                             uv_fs_t* req,
                             const char* tpl,
@@ -1582,6 +1596,12 @@ UV_EXTERN int uv_fs_stat(uv_loop_t* loop,
                          uv_fs_t* req,
                          const char* path,
                          uv_fs_cb cb);
+UV_EXTERN int uv_fs_statat(uv_loop_t* loop,
+                           uv_fs_t* req,
+                           uv_file dirfd,
+                           const char* path,
+                           int flags,
+                           uv_fs_cb cb);
 UV_EXTERN int uv_fs_fstat(uv_loop_t* loop,
                           uv_fs_t* req,
                           uv_file file,
@@ -1591,6 +1611,13 @@ UV_EXTERN int uv_fs_rename(uv_loop_t* loop,
                            const char* path,
                            const char* new_path,
                            uv_fs_cb cb);
+UV_EXTERN int uv_fs_renameat(uv_loop_t* loop,
+                             uv_fs_t* req,
+                             uv_file dirfd,
+                             const char* path,
+                             uv_file new_dirfd,
+                             const char* new_path,
+                             uv_fs_cb cb);
 UV_EXTERN int uv_fs_fsync(uv_loop_t* loop,
                           uv_fs_t* req,
                           uv_file file,
@@ -1616,11 +1643,23 @@ UV_EXTERN int uv_fs_access(uv_loop_t* loop,
                            const char* path,
                            int mode,
                            uv_fs_cb cb);
+UV_EXTERN int uv_fs_accessat(uv_loop_t* loop,
+                             uv_fs_t* req,
+                             uv_file dirfd,
+                             const char* path,
+                             int mode,
+                             uv_fs_cb cb);
 UV_EXTERN int uv_fs_chmod(uv_loop_t* loop,
                           uv_fs_t* req,
                           const char* path,
                           int mode,
                           uv_fs_cb cb);
+UV_EXTERN int uv_fs_chmodat(uv_loop_t* loop,
+                            uv_fs_t* req,
+                            uv_file dirfd,
+                            const char* path,
+                            int mode,
+                            uv_fs_cb cb);
 #define UV_FS_UTIME_NOW  (INFINITY)
 #define UV_FS_UTIME_OMIT (NAN)
 UV_EXTERN int uv_fs_utime(uv_loop_t* loop,
@@ -1641,6 +1680,14 @@ UV_EXTERN int uv_fs_lutime(uv_loop_t* loop,
                            double atime,
                            double mtime,
                            uv_fs_cb cb);
+UV_EXTERN int uv_fs_utimeat(uv_loop_t* loop,
+                            uv_fs_t* req,
+                            uv_file dirfd,
+                            const char* path,
+                            double atime,
+                            double mtime,
+                            int flags,
+                            uv_fs_cb cb);
 UV_EXTERN int uv_fs_lstat(uv_loop_t* loop,
                           uv_fs_t* req,
                           const char* path,
@@ -1650,6 +1697,13 @@ UV_EXTERN int uv_fs_link(uv_loop_t* loop,
                          const char* path,
                          const char* new_path,
                          uv_fs_cb cb);
+UV_EXTERN int uv_fs_linkat(uv_loop_t* loop,
+                           uv_fs_t* req,
+                           uv_file dirfd,
+                           const char* path,
+                           uv_file new_dirfd,
+                           const char* new_path,
+                           uv_fs_cb cb);
 
 /*
  * This flag can be used with uv_fs_symlink() on Windows to specify whether
@@ -1669,10 +1723,22 @@ UV_EXTERN int uv_fs_symlink(uv_loop_t* loop,
                             const char* new_path,
                             int flags,
                             uv_fs_cb cb);
+UV_EXTERN int uv_fs_symlinkat(uv_loop_t* loop,
+                              uv_fs_t* req,
+                              const char* path,
+                              uv_file new_dirfd,
+                              const char* new_path,
+                              int flags,
+                              uv_fs_cb cb);
 UV_EXTERN int uv_fs_readlink(uv_loop_t* loop,
                              uv_fs_t* req,
                              const char* path,
                              uv_fs_cb cb);
+UV_EXTERN int uv_fs_readlinkat(uv_loop_t* loop,
+                               uv_fs_t* req,
+                               uv_file dirfd,
+                               const char* path,
+                               uv_fs_cb cb);
 UV_EXTERN int uv_fs_realpath(uv_loop_t* loop,
                              uv_fs_t* req,
                              const char* path,
@@ -1700,6 +1766,14 @@ UV_EXTERN int uv_fs_lchown(uv_loop_t* loop,
                            uv_uid_t uid,
                            uv_gid_t gid,
                            uv_fs_cb cb);
+UV_EXTERN int uv_fs_chownat(uv_loop_t* loop,
+                            uv_fs_t* req,
+                            uv_file dirfd,
+                            const char* path,
+                            uv_uid_t uid,
+                            uv_gid_t gid,
+                            int flags,
+                            uv_fs_cb cb);
 UV_EXTERN int uv_fs_statfs(uv_loop_t* loop,
                            uv_fs_t* req,
                            const char* path,

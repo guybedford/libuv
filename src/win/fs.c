@@ -106,6 +106,8 @@ NTSTATUS uv__RtlUnicodeStringInit(
   do {                                                                      \
     req->sys_errno_ = (sys_errno);                                          \
     req->result = uv_translate_sys_error(req->sys_errno_);                  \
+    if (req->sys_errno_ == ERROR_DIRECTORY)                                 \
+      req->result = UV_ENOTDIR;                                             \
   } while (0)
 
 #define SET_REQ_UV_ERROR(req, uv_errno, sys_errno)                          \
@@ -120,6 +122,11 @@ NTSTATUS uv__RtlUnicodeStringInit(
     req->sys_errno_ = ERROR_INVALID_HANDLE;                                 \
     return;                                                                 \
   }
+
+/* utime uses fs.time alongside the dirfd in fs.info.fd_out. */
+STATIC_ASSERT(FIELD_OFFSET(uv_fs_t, fs.info.fd_out) >=
+              FIELD_OFFSET(uv_fs_t, fs.time) +
+              RTL_FIELD_SIZE(uv_fs_t, fs.time));
 
 #define NSEC_PER_TICK 100
 #define TICKS_PER_SEC ((int64_t) 1e9 / NSEC_PER_TICK)
@@ -441,56 +448,41 @@ static void uv__fs_req_init(uv_loop_t* loop,
 }
 
 
-/* CreateFileW(), with a relative path resolved against the directory open at
- * dirfd rather than the cwd. NtCreateFile() looks the name up under the
- * RootDirectory handle without Win32 path normalization, so "." and ".."
+/* Resolve dirfd for a path. On return *root is NULL when the path is to be
+ * used as a Win32 path (dirfd is UV_FS_AT_FDCWD or the path is not
+ * relative), else the directory handle the NT layer resolves it under.
+ * NtCreateFile() does no Win32 path normalization, so "." and ".."
  * components are not interpreted. */
-static HANDLE fs__create_file(int dirfd,
-                              WCHAR* path,
-                              DWORD access,
-                              DWORD share,
-                              DWORD disposition,
-                              DWORD flags) {
+static DWORD fs__dirfd_root(int dirfd, WCHAR* path, HANDLE* root) {
   FILE_STANDARD_INFO info;
-  OBJECT_ATTRIBUTES attr;
-  UNICODE_STRING name;
-  IO_STATUS_BLOCK iosb;
-  NTSTATUS status;
-  HANDLE handle;
-  ULONG options;
   WCHAR* p;
   WCHAR* q;
 
+  *root = NULL;
   if (dirfd == UV_FS_AT_FDCWD)
-    return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+    return 0;
 
-  if (path[0] == L'\0') {
-    SetLastError(ERROR_PATH_NOT_FOUND);
-    return INVALID_HANDLE_VALUE;
-  }
+  if (path[0] == L'\0')
+    return ERROR_PATH_NOT_FOUND;
 
   /* A path that is not relative ignores dirfd, as on UNIX. Rooted (\foo) and
    * drive-relative (C:foo) paths are classified as Win32 does and resolve
    * like any other. */
   if (IS_SLASH(path[0]) || path[1] == L':')
-    return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+    return 0;
 
-  handle = uv__get_osfhandle(dirfd);
-  if (handle == INVALID_HANDLE_VALUE) {
-    SetLastError(ERROR_INVALID_HANDLE);
-    return INVALID_HANDLE_VALUE;
-  }
+  *root = uv__get_osfhandle(dirfd);
+  if (*root == INVALID_HANDLE_VALUE)
+    return ERROR_INVALID_HANDLE;
 
-  if (!GetFileInformationByHandleEx(handle,
+  if (!GetFileInformationByHandleEx(*root,
                                     FileStandardInfo,
                                     &info,
                                     sizeof info))
-    return INVALID_HANDLE_VALUE;
+    return GetLastError();
 
-  if (!info.Directory) {
-    SetLastError(ERROR_DIRECTORY);
-    return INVALID_HANDLE_VALUE;
-  }
+  if (!info.Directory)
+    return ERROR_DIRECTORY;
 
   /* NtCreateFile() takes the name literally: only backslashes separate
    * components and a run of them is an error. */
@@ -502,14 +494,32 @@ static HANDLE fs__create_file(int dirfd,
   }
   *q = L'\0';
 
-  status = uv__RtlUnicodeStringInit(&name, path, q - path);
+  return 0;
+}
+
+
+/* NtCreateFile() under root, taking the CreateFileW() arguments. */
+static HANDLE fs__nt_create_file(HANDLE root,
+                                 WCHAR* path,
+                                 DWORD access,
+                                 DWORD share,
+                                 DWORD disposition,
+                                 DWORD flags) {
+  OBJECT_ATTRIBUTES attr;
+  UNICODE_STRING name;
+  IO_STATUS_BLOCK iosb;
+  NTSTATUS status;
+  HANDLE handle;
+  ULONG options;
+
+  status = uv__RtlUnicodeStringInit(&name, path, wcslen(path));
   if (!NT_SUCCESS(status)) {
     SetLastError(pRtlNtStatusToDosError(status));
     return INVALID_HANDLE_VALUE;
   }
 
   attr.Length = sizeof(attr);
-  attr.RootDirectory = handle;
+  attr.RootDirectory = root;
   attr.ObjectName = &name;
   attr.Attributes = OBJ_CASE_INSENSITIVE;
   attr.SecurityDescriptor = NULL;
@@ -524,10 +534,12 @@ static HANDLE fs__create_file(int dirfd,
   }
 
   options = FILE_SYNCHRONOUS_IO_NONALERT;
+  if (flags & FILE_ATTRIBUTE_DIRECTORY)
+    options |= FILE_DIRECTORY_FILE;
+  else if (!(flags & FILE_FLAG_BACKUP_SEMANTICS))
+    options |= FILE_NON_DIRECTORY_FILE;
   if (flags & FILE_FLAG_BACKUP_SEMANTICS)
     options |= FILE_OPEN_FOR_BACKUP_INTENT;
-  else
-    options |= FILE_NON_DIRECTORY_FILE;
   if (flags & FILE_FLAG_DELETE_ON_CLOSE)
     options |= FILE_DELETE_ON_CLOSE;
   if (flags & FILE_FLAG_NO_BUFFERING)
@@ -546,7 +558,7 @@ static HANDLE fs__create_file(int dirfd,
                          &attr,
                          &iosb,
                          NULL,
-                         flags & 0xFFFF, /* FILE_ATTRIBUTE_* */
+                         flags & 0xFFFF & ~FILE_ATTRIBUTE_DIRECTORY,
                          share,
                          disposition,
                          options,
@@ -558,6 +570,29 @@ static HANDLE fs__create_file(int dirfd,
   }
 
   return handle;
+}
+
+
+/* CreateFileW(), with a relative path resolved against dirfd. */
+static HANDLE fs__create_file(int dirfd,
+                              WCHAR* path,
+                              DWORD access,
+                              DWORD share,
+                              DWORD disposition,
+                              DWORD flags) {
+  HANDLE root;
+  DWORD error;
+
+  error = fs__dirfd_root(dirfd, path, &root);
+  if (error != 0) {
+    SetLastError(error);
+    return INVALID_HANDLE_VALUE;
+  }
+
+  if (root == NULL)
+    return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+
+  return fs__nt_create_file(root, path, access, share, disposition, flags);
 }
 
 
@@ -742,8 +777,6 @@ void fs__open(uv_fs_t* req) {
       /* Special case: when ERROR_FILE_EXISTS happens and UV_FS_O_CREAT was
        * specified, it means the path referred to a directory. */
       SET_REQ_UV_ERROR(req, UV_EISDIR, error);
-    } else if (error == ERROR_DIRECTORY) {
-      SET_REQ_UV_ERROR(req, UV_ENOTDIR, error);
     } else {
       SET_REQ_WIN32_ERROR(req, error);
     }
@@ -1256,7 +1289,7 @@ void fs__write(uv_fs_t* req) {
 
 
 static void fs__unlink_rmdir(uv_fs_t* req, BOOL isrmdir) {
-  const WCHAR* pathw = req->file.pathw;
+  WCHAR* pathw = req->file.pathw;
   HANDLE handle;
   FILE_BASIC_INFO info;
   FILE_DISPOSITION_INFORMATION disposition;
@@ -1265,13 +1298,14 @@ static void fs__unlink_rmdir(uv_fs_t* req, BOOL isrmdir) {
   NTSTATUS status;
   DWORD error;
 
-  handle = CreateFileW(pathw,
-                       FILE_READ_ATTRIBUTES | DELETE,
-                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                       NULL,
-                       OPEN_EXISTING,
-                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                       NULL);
+  handle = fs__create_file(req->fs.info.fd_out,
+                           pathw,
+                           FILE_READ_ATTRIBUTES | DELETE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                           OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT |
+                             FILE_FLAG_BACKUP_SEMANTICS);
 
   if (handle == INVALID_HANDLE_VALUE) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
@@ -1407,8 +1441,33 @@ static void fs__unlink(uv_fs_t* req) {
 
 
 void fs__mkdir(uv_fs_t* req) {
+  HANDLE handle;
+  HANDLE root;
+  DWORD error;
+
+  error = fs__dirfd_root(req->fs.info.fd_out, req->file.pathw, &root);
+  if (error != 0) {
+    SET_REQ_WIN32_ERROR(req, error);
+    return;
+  }
+
   /* TODO: use req->mode. */
-  if (CreateDirectoryW(req->file.pathw, NULL)) {
+  if (root != NULL) {
+    handle = fs__nt_create_file(root,
+                                req->file.pathw,
+                                FILE_LIST_DIRECTORY,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                                CREATE_NEW,
+                                FILE_FLAG_BACKUP_SEMANTICS |
+                                  FILE_ATTRIBUTE_DIRECTORY);
+    if (handle == INVALID_HANDLE_VALUE) {
+      SET_REQ_WIN32_ERROR(req, GetLastError());
+      return;
+    }
+    CloseHandle(handle);
+    SET_REQ_RESULT(req, 0);
+  } else if (CreateDirectoryW(req->file.pathw, NULL)) {
     SET_REQ_RESULT(req, 0);
   } else {
     SET_REQ_WIN32_ERROR(req, GetLastError());
@@ -2322,7 +2381,8 @@ cleanup:
   return ret_error;
 }
 
-static DWORD fs__stat_impl_from_path(WCHAR* path,
+static DWORD fs__stat_impl_from_path(int dirfd,
+                                     WCHAR* path,
                                      int do_lstat,
                                      uv_stat_t* statbuf) {
   HANDLE handle;
@@ -2330,13 +2390,15 @@ static DWORD fs__stat_impl_from_path(WCHAR* path,
   DWORD ret;
 
   /* If new API exists, try to use it. */
-  switch (fs__stat_path(path, statbuf, do_lstat)) {
-    case FS__STAT_PATH_SUCCESS:
-      return 0;
-    case FS__STAT_PATH_ERROR:
-      return GetLastError();
-    case FS__STAT_PATH_TRY_SLOW:
-      break;
+  if (dirfd == UV_FS_AT_FDCWD) {
+    switch (fs__stat_path(path, statbuf, do_lstat)) {
+      case FS__STAT_PATH_SUCCESS:
+        return 0;
+      case FS__STAT_PATH_ERROR:
+        return GetLastError();
+      case FS__STAT_PATH_TRY_SLOW:
+        break;
+    }
   }
 
   /* If the new API does not exist, use the old API. */
@@ -2344,16 +2406,18 @@ static DWORD fs__stat_impl_from_path(WCHAR* path,
   if (do_lstat)
     flags |= FILE_FLAG_OPEN_REPARSE_POINT;
 
-  handle = CreateFileW(path,
-                       FILE_READ_ATTRIBUTES,
-                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                       NULL,
-                       OPEN_EXISTING,
-                       flags,
-                       NULL);
+  handle = fs__create_file(dirfd,
+                           path,
+                           FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                           OPEN_EXISTING,
+                           flags);
 
   if (handle == INVALID_HANDLE_VALUE) {
     ret = GetLastError();
+    if (dirfd != UV_FS_AT_FDCWD)
+      return ret;
     if (ret != ERROR_ACCESS_DENIED && ret != ERROR_SHARING_VIOLATION)
       return ret;
     return fs__stat_directory(path, statbuf, do_lstat, ret);
@@ -2372,7 +2436,10 @@ static DWORD fs__stat_impl_from_path(WCHAR* path,
 static void fs__stat_impl(uv_fs_t* req, int do_lstat) {
   DWORD error;
 
-  error = fs__stat_impl_from_path(req->file.pathw, do_lstat, &req->statbuf);
+  error = fs__stat_impl_from_path(req->fs.info.fd_out,
+                                  req->file.pathw,
+                                  do_lstat,
+                                  &req->statbuf);
   if (error != 0) {
     if (do_lstat &&
         (error == ERROR_SYMLINK_NOT_SUPPORTED ||
@@ -2458,7 +2525,88 @@ static void fs__fstat(uv_fs_t* req) {
 }
 
 
+/* Rename or hard link relative to dirfd and new_dirfd. The new name is
+ * relative to the new_dirfd handle, or a full NT path when new_dirfd does not
+ * apply. */
+static void fs__rename_or_link(uv_fs_t* req, FILE_INFORMATION_CLASS cls) {
+  FILE_RENAME_INFORMATION* info;  /* FILE_LINK_INFORMATION is identical. */
+  UNICODE_STRING name;
+  IO_STATUS_BLOCK iosb;
+  NTSTATUS status;
+  WCHAR* new_pathw;
+  HANDLE handle;
+  HANDLE root;
+  DWORD error;
+
+  new_pathw = req->fs.info.new_pathw;
+  error = fs__dirfd_root(req->fs.info.file_flags, new_pathw, &root);
+  if (error != 0) {
+    SET_REQ_WIN32_ERROR(req, error);
+    return;
+  }
+
+  if (root != NULL) {
+    status = uv__RtlUnicodeStringInit(&name, new_pathw, wcslen(new_pathw));
+    if (!NT_SUCCESS(status)) {
+      SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(status));
+      return;
+    }
+  } else if (!pRtlDosPathNameToNtPathName_U(new_pathw, &name, NULL, NULL)) {
+    SET_REQ_WIN32_ERROR(req, ERROR_INVALID_NAME);
+    return;
+  }
+
+  handle = fs__create_file(req->fs.info.fd_out,
+                           req->file.pathw,
+                           cls == FileRenameInformation ? DELETE : 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                           OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT |
+                             FILE_FLAG_BACKUP_SEMANTICS);
+  if (handle == INVALID_HANDLE_VALUE) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    goto out;
+  }
+
+  info = uv__malloc(sizeof(*info) + name.Length);
+  if (info == NULL) {
+    SET_REQ_UV_ERROR(req, UV_ENOMEM, ERROR_OUTOFMEMORY);
+    CloseHandle(handle);
+    goto out;
+  }
+
+  info->ReplaceIfExists = cls == FileRenameInformation;
+  info->RootDirectory = root;
+  info->FileNameLength = name.Length;
+  memcpy(info->FileName, name.Buffer, name.Length);
+
+  status = pNtSetInformationFile(handle,
+                                 &iosb,
+                                 info,
+                                 sizeof(*info) + name.Length,
+                                 cls);
+  if (NT_SUCCESS(status))
+    SET_REQ_RESULT(req, 0);
+  else
+    SET_REQ_WIN32_ERROR(req, pRtlNtStatusToDosError(status));
+
+  uv__free(info);
+  CloseHandle(handle);
+
+out:
+  if (root == NULL)
+    pRtlFreeUnicodeString(&name);
+}
+
+
 static void fs__rename(uv_fs_t* req) {
+  if (req->fs.info.fd_out != UV_FS_AT_FDCWD ||
+      req->fs.info.file_flags != UV_FS_AT_FDCWD) {
+    fs__rename_or_link(req, FileRenameInformation);
+    return;
+  }
+
   if (!MoveFileExW(req->file.pathw, req->fs.info.new_pathw, MOVEFILE_REPLACE_EXISTING)) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
     return;
@@ -2594,8 +2742,14 @@ static void fs__copyfile(uv_fs_t* req) {
     return;
 
   /* if error UV_EBUSY check if src and dst file are the same */
-  if (fs__stat_impl_from_path(req->file.pathw, 0, &statbuf) != 0 ||
-      fs__stat_impl_from_path(req->fs.info.new_pathw, 0, &new_statbuf) != 0) {
+  if (fs__stat_impl_from_path(UV_FS_AT_FDCWD,
+                              req->file.pathw,
+                              0,
+                              &statbuf) != 0 ||
+      fs__stat_impl_from_path(UV_FS_AT_FDCWD,
+                              req->fs.info.new_pathw,
+                              0,
+                              &new_statbuf) != 0) {
     return;
   }
 
@@ -2654,11 +2808,47 @@ static void fs__sendfile(uv_fs_t* req) {
 
 
 static void fs__access(uv_fs_t* req) {
-  DWORD attr = GetFileAttributesW(req->file.pathw);
+  FILE_BASIC_INFO info;
+  HANDLE handle;
+  HANDLE root;
+  DWORD error;
+  DWORD attr;
 
-  if (attr == INVALID_FILE_ATTRIBUTES) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
+  error = fs__dirfd_root(req->fs.info.fd_out, req->file.pathw, &root);
+  if (error != 0) {
+    SET_REQ_WIN32_ERROR(req, error);
     return;
+  }
+
+  if (root == NULL) {
+    attr = GetFileAttributesW(req->file.pathw);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+      SET_REQ_WIN32_ERROR(req, GetLastError());
+      return;
+    }
+  } else {
+    handle = fs__nt_create_file(root,
+                                req->file.pathw,
+                                0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                                OPEN_EXISTING,
+                                FILE_FLAG_OPEN_REPARSE_POINT |
+                                  FILE_FLAG_BACKUP_SEMANTICS);
+    if (handle == INVALID_HANDLE_VALUE) {
+      SET_REQ_WIN32_ERROR(req, GetLastError());
+      return;
+    }
+    if (!GetFileInformationByHandleEx(handle,
+                                      FileBasicInfo,
+                                      &info,
+                                      sizeof info)) {
+      SET_REQ_WIN32_ERROR(req, GetLastError());
+      CloseHandle(handle);
+      return;
+    }
+    CloseHandle(handle);
+    attr = info.FileAttributes;
   }
 
   /*
@@ -2679,30 +2869,11 @@ static void fs__access(uv_fs_t* req) {
 }
 
 
-static void fs__chmod(uv_fs_t* req) {
-  int result = _wchmod(req->file.pathw, req->fs.info.mode);
-  if (result == -1)
-    SET_REQ_WIN32_ERROR(req, _doserrno);
-  else
-    SET_REQ_RESULT(req, 0);
-}
-
-
-static void fs__fchmod(uv_fs_t* req) {
-  int fd = req->file.fd;
+static void fs__chmod_handle(uv_fs_t* req, HANDLE handle) {
   int clear_archive_flag;
-  HANDLE handle;
   NTSTATUS nt_status;
   IO_STATUS_BLOCK io_status;
   FILE_BASIC_INFORMATION file_info;
-
-  VERIFY_FD(fd, req);
-
-  handle = ReOpenFile(uv__get_osfhandle(fd), FILE_WRITE_ATTRIBUTES, 0, 0);
-  if (handle == INVALID_HANDLE_VALUE) {
-    SET_REQ_WIN32_ERROR(req, GetLastError());
-    return;
-  }
 
   nt_status = pNtQueryInformationFile(handle,
                                       &io_status,
@@ -2774,6 +2945,59 @@ fchmod_cleanup:
 }
 
 
+static void fs__chmod(uv_fs_t* req) {
+  HANDLE handle;
+  HANDLE root;
+  DWORD error;
+  int result;
+
+  error = fs__dirfd_root(req->fs.info.fd_out, req->file.pathw, &root);
+  if (error != 0) {
+    SET_REQ_WIN32_ERROR(req, error);
+    return;
+  }
+
+  if (root == NULL) {
+    result = _wchmod(req->file.pathw, req->fs.info.mode);
+    if (result == -1)
+      SET_REQ_WIN32_ERROR(req, _doserrno);
+    else
+      SET_REQ_RESULT(req, 0);
+    return;
+  }
+
+  handle = fs__nt_create_file(root,
+                              req->file.pathw,
+                              FILE_WRITE_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                FILE_SHARE_DELETE,
+                              OPEN_EXISTING,
+                              FILE_FLAG_BACKUP_SEMANTICS);
+  if (handle == INVALID_HANDLE_VALUE) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    return;
+  }
+
+  fs__chmod_handle(req, handle);
+}
+
+
+static void fs__fchmod(uv_fs_t* req) {
+  int fd = req->file.fd;
+  HANDLE handle;
+
+  VERIFY_FD(fd, req);
+
+  handle = ReOpenFile(uv__get_osfhandle(fd), FILE_WRITE_ATTRIBUTES, 0, 0);
+  if (handle == INVALID_HANDLE_VALUE) {
+    SET_REQ_WIN32_ERROR(req, GetLastError());
+    return;
+  }
+
+  fs__chmod_handle(req, handle);
+}
+
+
 static int fs__utime_handle(HANDLE handle, double atime, double mtime) {
   FILETIME filetime_as, *filetime_a = &filetime_as;
   FILETIME filetime_ms, *filetime_m = &filetime_ms;
@@ -2802,7 +3026,8 @@ static int fs__utime_handle(HANDLE handle, double atime, double mtime) {
   return 0;
 }
 
-static DWORD fs__utime_impl_from_path(WCHAR* path,
+static DWORD fs__utime_impl_from_path(int dirfd,
+                                      WCHAR* path,
                                       double atime,
                                       double mtime,
                                       int do_lutime) {
@@ -2815,13 +3040,13 @@ static DWORD fs__utime_impl_from_path(WCHAR* path,
     flags |= FILE_FLAG_OPEN_REPARSE_POINT;
   }
 
-  handle = CreateFileW(path,
-                       FILE_WRITE_ATTRIBUTES,
-                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                       NULL,
-                       OPEN_EXISTING,
-                       flags,
-                       NULL);
+  handle = fs__create_file(dirfd,
+                           path,
+                           FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                           OPEN_EXISTING,
+                           flags);
 
   if (handle == INVALID_HANDLE_VALUE)
     return GetLastError();
@@ -2838,7 +3063,8 @@ static DWORD fs__utime_impl_from_path(WCHAR* path,
 static void fs__utime_impl(uv_fs_t* req, int do_lutime) {
   DWORD error;
 
-  error = fs__utime_impl_from_path(req->file.pathw,
+  error = fs__utime_impl_from_path(req->fs.info.fd_out,
+                                   req->file.pathw,
                                    req->fs.time.atime,
                                    req->fs.time.mtime,
                                    do_lutime);
@@ -2891,7 +3117,15 @@ static void fs__lutime(uv_fs_t* req) {
 
 
 static void fs__link(uv_fs_t* req) {
-  DWORD r = CreateHardLinkW(req->fs.info.new_pathw, req->file.pathw, NULL);
+  DWORD r;
+
+  if (req->fs.info.fd_out != UV_FS_AT_FDCWD ||
+      req->fs.info.file_flags != UV_FS_AT_FDCWD) {
+    fs__rename_or_link(req, FileLinkInformation);
+    return;
+  }
+
+  r = CreateHardLinkW(req->fs.info.new_pathw, req->file.pathw, NULL);
   if (r == 0)
     SET_REQ_WIN32_ERROR(req, GetLastError());
   else
@@ -3073,11 +3307,24 @@ error:
 static void fs__symlink(uv_fs_t* req) {
   WCHAR* pathw;
   WCHAR* new_pathw;
+  HANDLE root;
   int flags;
   int err;
 
   pathw = req->file.pathw;
   new_pathw = req->fs.info.new_pathw;
+
+  if (req->fs.info.fd_out != UV_FS_AT_FDCWD) {
+    err = fs__dirfd_root(req->fs.info.fd_out, new_pathw, &root);
+    if (err != 0) {
+      SET_REQ_WIN32_ERROR(req, err);
+      return;
+    }
+    if (root != NULL) {
+      SET_REQ_UV_ERROR(req, UV_ENOTSUP, ERROR_NOT_SUPPORTED);
+      return;
+    }
+  }
 
   if (req->fs.info.file_flags & UV_FS_SYMLINK_JUNCTION) {
     fs__create_junction(req, pathw, new_pathw);
@@ -3114,13 +3361,13 @@ static void fs__symlink(uv_fs_t* req) {
 static void fs__readlink(uv_fs_t* req) {
   HANDLE handle;
 
-  handle = CreateFileW(req->file.pathw,
-                       0,
-                       0,
-                       NULL,
-                       OPEN_EXISTING,
-                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                       NULL);
+  handle = fs__create_file(req->fs.info.fd_out,
+                           req->file.pathw,
+                           0,
+                           0,
+                           OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT |
+                             FILE_FLAG_BACKUP_SEMANTICS);
 
   if (handle == INVALID_HANDLE_VALUE) {
     SET_REQ_WIN32_ERROR(req, GetLastError());
@@ -3490,21 +3737,40 @@ int uv_fs_write(uv_loop_t* loop,
 
 int uv_fs_unlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     uv_fs_cb cb) {
+  return uv_fs_unlinkat(loop, req, UV_FS_AT_FDCWD, path, 0, cb);
+}
+
+
+int uv_fs_unlinkat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, int flags, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_UNLINK);
+  if (flags & ~UV_FS_AT_REMOVEDIR) {
+    SET_REQ_UV_ERROR(req, UV_EINVAL, ERROR_INVALID_PARAMETER);
+    return UV_EINVAL;
+  }
+  if (flags)
+    req->fs_type = UV_FS_RMDIR;
   err = fs__capture_path(req, path, NULL, cb != NULL);
   if (err) {
     SET_REQ_WIN32_ERROR(req, err);
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   POST;
 }
 
 
 int uv_fs_mkdir(uv_loop_t* loop, uv_fs_t* req, const char* path, int mode,
     uv_fs_cb cb) {
+  return uv_fs_mkdirat(loop, req, UV_FS_AT_FDCWD, path, mode, cb);
+}
+
+
+int uv_fs_mkdirat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, int mode, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_MKDIR);
@@ -3514,6 +3780,7 @@ int uv_fs_mkdir(uv_loop_t* loop, uv_fs_t* req, const char* path, int mode,
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   req->fs.info.mode = mode;
   POST;
 }
@@ -3554,16 +3821,8 @@ int uv_fs_mkstemp(uv_loop_t* loop,
 
 
 int uv_fs_rmdir(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_RMDIR);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err) {
-    SET_REQ_WIN32_ERROR(req, err);
-    return req->result;
-  }
-
-  POST;
+  return uv_fs_unlinkat(loop, req, UV_FS_AT_FDCWD, path, UV_FS_AT_REMOVEDIR,
+                        cb);
 }
 
 
@@ -3629,6 +3888,13 @@ int uv_fs_closedir(uv_loop_t* loop,
 
 int uv_fs_link(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, uv_fs_cb cb) {
+  return uv_fs_linkat(loop, req, UV_FS_AT_FDCWD, path, UV_FS_AT_FDCWD, new_path,
+                      cb);
+}
+
+
+int uv_fs_linkat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, uv_file new_dirfd, const char* new_path, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_LINK);
@@ -3638,12 +3904,20 @@ int uv_fs_link(uv_loop_t* loop, uv_fs_t* req, const char* path,
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
+  req->fs.info.file_flags = new_dirfd;
   POST;
 }
 
 
 int uv_fs_symlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, int flags, uv_fs_cb cb) {
+  return uv_fs_symlinkat(loop, req, path, UV_FS_AT_FDCWD, new_path, flags, cb);
+}
+
+
+int uv_fs_symlinkat(uv_loop_t* loop, uv_fs_t* req, const char* path,
+    uv_file new_dirfd, const char* new_path, int flags, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_SYMLINK);
@@ -3653,6 +3927,7 @@ int uv_fs_symlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     return req->result;
   }
 
+  req->fs.info.fd_out = new_dirfd;
   req->fs.info.file_flags = flags;
   POST;
 }
@@ -3660,6 +3935,12 @@ int uv_fs_symlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
 
 int uv_fs_readlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     uv_fs_cb cb) {
+  return uv_fs_readlinkat(loop, req, UV_FS_AT_FDCWD, path, cb);
+}
+
+
+int uv_fs_readlinkat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_READLINK);
@@ -3669,6 +3950,7 @@ int uv_fs_readlink(uv_loop_t* loop, uv_fs_t* req, const char* path,
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   POST;
 }
 
@@ -3696,15 +3978,28 @@ int uv_fs_realpath(uv_loop_t* loop, uv_fs_t* req, const char* path,
 
 int uv_fs_chown(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_uid_t uid,
     uv_gid_t gid, uv_fs_cb cb) {
+  return uv_fs_chownat(loop, req, UV_FS_AT_FDCWD, path, uid, gid, 0, cb);
+}
+
+
+int uv_fs_chownat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, uv_uid_t uid, uv_gid_t gid, int flags, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_CHOWN);
+  if (flags & ~UV_FS_AT_SYMLINK_NOFOLLOW) {
+    SET_REQ_UV_ERROR(req, UV_EINVAL, ERROR_INVALID_PARAMETER);
+    return UV_EINVAL;
+  }
+  if (flags)
+    req->fs_type = UV_FS_LCHOWN;
   err = fs__capture_path(req, path, NULL, cb != NULL);
   if (err) {
     SET_REQ_WIN32_ERROR(req, err);
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   POST;
 }
 
@@ -3718,44 +4013,41 @@ int uv_fs_fchown(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_uid_t uid,
 
 int uv_fs_lchown(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_uid_t uid,
     uv_gid_t gid, uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_LCHOWN);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err) {
-    SET_REQ_WIN32_ERROR(req, err);
-    return req->result;
-  }
-
-  POST;
+  return uv_fs_chownat(loop, req, UV_FS_AT_FDCWD, path, uid, gid,
+                       UV_FS_AT_SYMLINK_NOFOLLOW, cb);
 }
 
 
 int uv_fs_stat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
+  return uv_fs_statat(loop, req, UV_FS_AT_FDCWD, path, 0, cb);
+}
+
+
+int uv_fs_statat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, int flags, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_STAT);
+  if (flags & ~UV_FS_AT_SYMLINK_NOFOLLOW) {
+    SET_REQ_UV_ERROR(req, UV_EINVAL, ERROR_INVALID_PARAMETER);
+    return UV_EINVAL;
+  }
+  if (flags)
+    req->fs_type = UV_FS_LSTAT;
   err = fs__capture_path(req, path, NULL, cb != NULL);
   if (err) {
     SET_REQ_WIN32_ERROR(req, err);
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   POST;
 }
 
 
 int uv_fs_lstat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_LSTAT);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err) {
-    SET_REQ_WIN32_ERROR(req, err);
-    return req->result;
-  }
-
-  POST;
+  return uv_fs_statat(loop, req, UV_FS_AT_FDCWD, path,
+                      UV_FS_AT_SYMLINK_NOFOLLOW, cb);
 }
 
 
@@ -3768,6 +4060,13 @@ int uv_fs_fstat(uv_loop_t* loop, uv_fs_t* req, uv_file fd, uv_fs_cb cb) {
 
 int uv_fs_rename(uv_loop_t* loop, uv_fs_t* req, const char* path,
     const char* new_path, uv_fs_cb cb) {
+  return uv_fs_renameat(loop, req, UV_FS_AT_FDCWD, path, UV_FS_AT_FDCWD,
+                        new_path, cb);
+}
+
+
+int uv_fs_renameat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, uv_file new_dirfd, const char* new_path, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_RENAME);
@@ -3777,6 +4076,8 @@ int uv_fs_rename(uv_loop_t* loop, uv_fs_t* req, const char* path,
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
+  req->fs.info.file_flags = new_dirfd;
   POST;
 }
 
@@ -3850,6 +4151,12 @@ int uv_fs_access(uv_loop_t* loop,
                  const char* path,
                  int flags,
                  uv_fs_cb cb) {
+  return uv_fs_accessat(loop, req, UV_FS_AT_FDCWD, path, flags, cb);
+}
+
+
+int uv_fs_accessat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, int mode, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_ACCESS);
@@ -3859,13 +4166,20 @@ int uv_fs_access(uv_loop_t* loop,
     return req->result;
   }
 
-  req->fs.info.mode = flags;
+  req->fs.info.fd_out = dirfd;
+  req->fs.info.mode = mode;
   POST;
 }
 
 
 int uv_fs_chmod(uv_loop_t* loop, uv_fs_t* req, const char* path, int mode,
     uv_fs_cb cb) {
+  return uv_fs_chmodat(loop, req, UV_FS_AT_FDCWD, path, mode, cb);
+}
+
+
+int uv_fs_chmodat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, int mode, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_CHMOD);
@@ -3875,6 +4189,7 @@ int uv_fs_chmod(uv_loop_t* loop, uv_fs_t* req, const char* path, int mode,
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   req->fs.info.mode = mode;
   POST;
 }
@@ -3891,15 +4206,28 @@ int uv_fs_fchmod(uv_loop_t* loop, uv_fs_t* req, uv_file fd, int mode,
 
 int uv_fs_utime(uv_loop_t* loop, uv_fs_t* req, const char* path, double atime,
     double mtime, uv_fs_cb cb) {
+  return uv_fs_utimeat(loop, req, UV_FS_AT_FDCWD, path, atime, mtime, 0, cb);
+}
+
+
+int uv_fs_utimeat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd,
+    const char* path, double atime, double mtime, int flags, uv_fs_cb cb) {
   int err;
 
   INIT(UV_FS_UTIME);
+  if (flags & ~UV_FS_AT_SYMLINK_NOFOLLOW) {
+    SET_REQ_UV_ERROR(req, UV_EINVAL, ERROR_INVALID_PARAMETER);
+    return UV_EINVAL;
+  }
+  if (flags)
+    req->fs_type = UV_FS_LUTIME;
   err = fs__capture_path(req, path, NULL, cb != NULL);
   if (err) {
     SET_REQ_WIN32_ERROR(req, err);
     return req->result;
   }
 
+  req->fs.info.fd_out = dirfd;
   req->fs.time.atime = atime;
   req->fs.time.mtime = mtime;
   POST;
@@ -3917,18 +4245,8 @@ int uv_fs_futime(uv_loop_t* loop, uv_fs_t* req, uv_file fd, double atime,
 
 int uv_fs_lutime(uv_loop_t* loop, uv_fs_t* req, const char* path, double atime,
     double mtime, uv_fs_cb cb) {
-  int err;
-
-  INIT(UV_FS_LUTIME);
-  err = fs__capture_path(req, path, NULL, cb != NULL);
-  if (err) {
-    SET_REQ_WIN32_ERROR(req, err);
-    return req->result;
-  }
-
-  req->fs.time.atime = atime;
-  req->fs.time.mtime = mtime;
-  POST;
+  return uv_fs_utimeat(loop, req, UV_FS_AT_FDCWD, path, atime, mtime,
+                       UV_FS_AT_SYMLINK_NOFOLLOW, cb);
 }
 
 

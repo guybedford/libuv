@@ -4383,6 +4383,13 @@ typedef struct _FILE_DISPOSITION_INFORMATION {
   BOOLEAN DeleteFile;
 } FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
 
+typedef struct _FILE_RENAME_INFORMATION {
+  BOOLEAN ReplaceIfExists;
+  HANDLE  RootDirectory;
+  ULONG   FileNameLength;
+  WCHAR   FileName[1];
+} FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
+
 typedef struct _FILE_DISPOSITION_INFORMATION_EX {
   DWORD Flags;
 } FILE_DISPOSITION_INFORMATION_EX, *PFILE_DISPOSITION_INFORMATION_EX;
@@ -4630,6 +4637,15 @@ typedef NTSTATUS (NTAPI *sRtlGetVersion)
 typedef ULONG (NTAPI *sRtlNtStatusToDosError)
               (NTSTATUS Status);
 
+typedef BOOLEAN (NTAPI *sRtlDosPathNameToNtPathName_U)
+                (PCWSTR DosName,
+                 PUNICODE_STRING NtName,
+                 PCWSTR* PartName,
+                 PVOID RelativeName);
+
+typedef VOID (NTAPI *sRtlFreeUnicodeString)
+             (PUNICODE_STRING UnicodeString);
+
 typedef NTSTATUS (NTAPI *sNtDeviceIoControlFile)
                  (HANDLE FileHandle,
                   HANDLE Event,
@@ -4855,6 +4871,8 @@ typedef BOOL(WINAPI* sGetFileInformationByName)(
 /* Ntdll function pointers */
 extern sRtlGetVersion pRtlGetVersion;
 extern sRtlNtStatusToDosError pRtlNtStatusToDosError;
+extern sRtlDosPathNameToNtPathName_U pRtlDosPathNameToNtPathName_U;
+extern sRtlFreeUnicodeString pRtlFreeUnicodeString;
 extern sNtDeviceIoControlFile pNtDeviceIoControlFile;
 extern sNtCreateFile pNtCreateFile;
 extern sNtQueryInformationFile pNtQueryInformationFile;

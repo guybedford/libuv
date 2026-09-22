@@ -638,8 +638,8 @@ struct uv__req_write_extra_s {
       int mode;                                                               \
       WCHAR* new_pathw;                                                       \
       int file_flags;                                                         \
-      int fd_out;                                                             \
       unsigned int nbufs;                                                     \
+      int fd_out;                                                             \
       uv_buf_t* bufs;                                                         \
       int64_t offset;                                                         \
       uv_buf_t bufsml[4];                                                     \

@@ -534,6 +534,47 @@ API
 
     .. versionchanged:: 1.21.0 implemented uv_fs_lchown
 
+.. c:function:: int uv_fs_unlinkat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, int flags, uv_fs_cb cb)
+.. c:function:: int uv_fs_mkdirat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, int mode, uv_fs_cb cb)
+.. c:function:: int uv_fs_renameat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, uv_file new_dirfd, const char* new_path, uv_fs_cb cb)
+.. c:function:: int uv_fs_linkat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, uv_file new_dirfd, const char* new_path, uv_fs_cb cb)
+.. c:function:: int uv_fs_symlinkat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_file new_dirfd, const char* new_path, int flags, uv_fs_cb cb)
+.. c:function:: int uv_fs_readlinkat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, uv_fs_cb cb)
+.. c:function:: int uv_fs_statat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, int flags, uv_fs_cb cb)
+.. c:function:: int uv_fs_accessat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, int mode, uv_fs_cb cb)
+.. c:function:: int uv_fs_chmodat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, int mode, uv_fs_cb cb)
+.. c:function:: int uv_fs_chownat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, uv_uid_t uid, uv_gid_t gid, int flags, uv_fs_cb cb)
+.. c:function:: int uv_fs_utimeat(uv_loop_t* loop, uv_fs_t* req, uv_file dirfd, const char* path, double atime, double mtime, int flags, uv_fs_cb cb)
+
+    Equivalent to :man:`unlinkat(2)`, :man:`mkdirat(2)`, :man:`renameat(2)`,
+    :man:`linkat(2)`, :man:`symlinkat(2)`, :man:`readlinkat(2)`,
+    :man:`fstatat(2)`, :man:`faccessat(2)`, :man:`fchmodat(2)`,
+    :man:`fchownat(2)` and :man:`utimensat(2)` respectively.
+
+    `dirfd` (`new_dirfd` for `new_path`) is resolved as described for
+    :c:func:`uv_fs_openat`, including the Windows and z/OS notes there. With
+    ``UV_FS_AT_FDCWD`` each function behaves exactly like its non-`at`
+    counterpart.
+
+    `flags` accepts the following, with any other bit failing with
+    ``UV_EINVAL``:
+
+    - ``UV_FS_AT_SYMLINK_NOFOLLOW``: for `uv_fs_statat()`, `uv_fs_chownat()`
+      and `uv_fs_utimeat()`, operate on a symbolic link itself rather than
+      its target. The request completes as ``UV_FS_LSTAT``, ``UV_FS_LCHOWN``
+      or ``UV_FS_LUTIME``.
+    - ``UV_FS_AT_REMOVEDIR``: for `uv_fs_unlinkat()`, remove a directory.
+      The request completes as ``UV_FS_RMDIR``.
+    - `uv_fs_symlinkat()` takes the same `flags` as :c:func:`uv_fs_symlink`.
+
+    .. note::
+        Windows: `uv_fs_symlinkat()` with a `new_dirfd` other than
+        ``UV_FS_AT_FDCWD`` fails with ``UV_ENOTSUP``; symbolic links are
+        created with `CreateSymbolicLinkW`, which has no directory-relative
+        form.
+
+    .. versionadded:: 1.53.0
+
 .. c:function:: uv_fs_type uv_fs_get_type(const uv_fs_t* req)
 
     Returns `req->fs_type`.

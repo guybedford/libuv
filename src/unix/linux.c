@@ -975,9 +975,9 @@ int uv__iou_fs_link(uv_loop_t* loop, uv_fs_t* req) {
     return 0;
 
   sqe->addr = (uintptr_t) req->path;
-  sqe->fd = AT_FDCWD;
+  sqe->fd = req->file;
   sqe->addr2 = (uintptr_t) req->new_path;
-  sqe->len = AT_FDCWD;
+  sqe->len = req->flags;
   sqe->opcode = UV__IORING_OP_LINKAT;
 
   uv__iou_submit(iou);
@@ -999,7 +999,7 @@ int uv__iou_fs_mkdir(uv_loop_t* loop, uv_fs_t* req) {
     return 0;
 
   sqe->addr = (uintptr_t) req->path;
-  sqe->fd = AT_FDCWD;
+  sqe->fd = req->file;
   sqe->len = req->mode;
   sqe->opcode = UV__IORING_OP_MKDIRAT;
 
@@ -1042,9 +1042,9 @@ int uv__iou_fs_rename(uv_loop_t* loop, uv_fs_t* req) {
     return 0;
 
   sqe->addr = (uintptr_t) req->path;
-  sqe->fd = AT_FDCWD;
+  sqe->fd = req->file;
   sqe->addr2 = (uintptr_t) req->new_path;
-  sqe->len = AT_FDCWD;
+  sqe->len = req->flags;
   sqe->opcode = UV__IORING_OP_RENAMEAT;
 
   uv__iou_submit(iou);
@@ -1066,7 +1066,7 @@ int uv__iou_fs_symlink(uv_loop_t* loop, uv_fs_t* req) {
     return 0;
 
   sqe->addr = (uintptr_t) req->path;
-  sqe->fd = AT_FDCWD;
+  sqe->fd = req->file;
   sqe->addr2 = (uintptr_t) req->new_path;
   sqe->opcode = UV__IORING_OP_SYMLINKAT;
 
@@ -1087,7 +1087,7 @@ int uv__iou_fs_unlink(uv_loop_t* loop, uv_fs_t* req) {
     return 0;
 
   sqe->addr = (uintptr_t) req->path;
-  sqe->fd = AT_FDCWD;
+  sqe->fd = req->file;
   sqe->opcode = UV__IORING_OP_UNLINKAT;
 
   uv__iou_submit(iou);
@@ -1153,13 +1153,12 @@ int uv__iou_fs_statx(uv_loop_t* loop,
 
   sqe->addr = (uintptr_t) req->path;
   sqe->addr2 = (uintptr_t) statxbuf;
-  sqe->fd = AT_FDCWD;
+  sqe->fd = req->file;
   sqe->len = 0xFFF; /* STATX_BASIC_STATS + STATX_BTIME */
   sqe->opcode = UV__IORING_OP_STATX;
 
   if (is_fstat) {
     sqe->addr = (uintptr_t) "";
-    sqe->fd = req->file;
     sqe->statx_flags |= 0x1000; /* AT_EMPTY_PATH */
   }
 

@@ -63,6 +63,9 @@
 # define S_IFDIR _S_IFDIR
 # define S_IFCHR _S_IFCHR
 # define S_IFREG _S_IFREG
+# ifndef S_IFMT
+#  define S_IFMT _S_IFMT
+# endif
 #endif
 
 #define TOO_LONG_NAME_LENGTH 65536
@@ -5230,6 +5233,270 @@ TEST_FS_IMPL(fs_stat_batch_multiple) {
 
   uv_run(loop, UV_RUN_DEFAULT);
   ASSERT_EQ(stat_cb_count, ARRAY_SIZE(req));
+
+  MAKE_VALGRIND_HAPPY(loop);
+  return 0;
+}
+
+
+static int at_cb_count;
+
+static void at_cb(uv_fs_t* req) {
+  ASSERT_GE(req->result, 0);
+  if (req->fs_type == UV_FS_OPEN)
+    close(req->result);
+  at_cb_count++;
+  uv_fs_req_cleanup(req);
+}
+
+
+TEST_FS_IMPL(fs_at) {
+  uv_fs_t reqs[4];
+  uv_fs_t req;
+  uv_stat_t* s;
+  uv_file dirfd;
+  uv_file fd;
+  char cwd[PATHMAX];
+  char path[PATHMAX + 32];
+  size_t len;
+  int r;
+  int i;
+
+  /* Setup. */
+  unlink("test_dir/file");
+  unlink("test_dir/link");
+  unlink("test_dir/hard");
+  unlink("test_dir/renamed");
+  rmdir("test_dir/sub");
+  rmdir("test_dir");
+  unlink("test_dir_moved/file");
+  unlink("test_dir_moved/hard");
+  unlink("test_dir_moved/hard2");
+  unlink("test_dir_moved/renamed");
+  rmdir("test_dir_moved/sub");
+  rmdir("test_dir_moved/sub2");
+  rmdir("test_dir_moved");
+
+  loop = uv_default_loop();
+
+  /* Unknown flags are rejected before the request is queued. */
+  ASSERT_EQ(UV_EINVAL,
+            uv_fs_unlinkat(NULL, &req, UV_FS_AT_FDCWD, "test_dir", 4, NULL));
+  ASSERT_EQ(UV_EINVAL,
+            uv_fs_statat(NULL, &req, UV_FS_AT_FDCWD, "test_dir", 2, NULL));
+  ASSERT_EQ(UV_EINVAL,
+            uv_fs_chownat(NULL, &req, UV_FS_AT_FDCWD, "test_dir", 0, 0, 2,
+                          NULL));
+  ASSERT_EQ(UV_EINVAL,
+            uv_fs_utimeat(NULL, &req, UV_FS_AT_FDCWD, "test_dir", 0, 0, 2,
+                          NULL));
+
+  /* UV_FS_AT_FDCWD resolves like the plain functions. */
+  r = uv_fs_mkdirat(NULL, &req, UV_FS_AT_FDCWD, "test_dir", 0755, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, UV_FS_AT_FDCWD, "test_dir", 0, NULL);
+  ASSERT_OK(r);
+  s = req.ptr;
+  ASSERT_EQ(s->st_mode & S_IFMT, S_IFDIR);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_open(NULL, &req, "test_dir", UV_FS_O_RDONLY | UV_FS_O_DIRECTORY, 0,
+                 NULL);
+  ASSERT_GE(r, 0);
+  dirfd = r;
+  uv_fs_req_cleanup(&req);
+
+  /* A relative path is resolved against dirfd, not the cwd. */
+  r = uv_fs_openat(NULL, &req, dirfd, "file",
+                   UV_FS_O_WRONLY | UV_FS_O_CREAT | UV_FS_O_EXCL,
+                   S_IWUSR | S_IRUSR, NULL);
+  ASSERT_GE(r, 0);
+  fd = r;
+  uv_fs_req_cleanup(&req);
+
+  iov = uv_buf_init(test_buf, sizeof(test_buf));
+  r = uv_fs_write(NULL, &req, fd, &iov, 1, -1, NULL);
+  ASSERT_EQ(r, sizeof(test_buf));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_close(NULL, &req, fd, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_stat(NULL, &req, "file", NULL);
+  ASSERT_EQ(r, UV_ENOENT);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, dirfd, "file", 0, NULL);
+  ASSERT_OK(r);
+  s = req.ptr;
+  ASSERT_EQ(s->st_size, sizeof(test_buf));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_mkdirat(NULL, &req, dirfd, "sub", 0755, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, dirfd, "sub", 0, NULL);
+  ASSERT_OK(r);
+  s = req.ptr;
+  ASSERT_EQ(s->st_mode & S_IFMT, S_IFDIR);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_linkat(NULL, &req, dirfd, "file", dirfd, "hard", NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_renameat(NULL, &req, dirfd, "hard", dirfd, "renamed", NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_accessat(NULL, &req, dirfd, "renamed", R_OK, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_chmodat(NULL, &req, dirfd, "renamed", 0400, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, dirfd, "renamed", 0, NULL);
+  ASSERT_OK(r);
+  s = req.ptr;
+  ASSERT(!(s->st_mode & S_IWUSR));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_chmodat(NULL, &req, dirfd, "renamed", 0600, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_chownat(NULL, &req, dirfd, "renamed", -1, -1, 0, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_utimeat(NULL, &req, dirfd, "renamed", 1, 2, 0, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, dirfd, "renamed", 0, NULL);
+  ASSERT_OK(r);
+  s = req.ptr;
+  ASSERT(s->st_mode & S_IWUSR);
+  ASSERT_EQ(s->st_mtim.tv_sec, 2);
+  uv_fs_req_cleanup(&req);
+
+  /* An absolute path ignores dirfd. */
+  len = sizeof(cwd);
+  ASSERT_OK(uv_cwd(cwd, &len));
+  snprintf(path, sizeof(path), "%s/test_dir/file", cwd);
+  r = uv_fs_statat(NULL, &req, dirfd, path, 0, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  /* Errors. */
+  r = uv_fs_statat(NULL, &req, -1, "file", 0, NULL);
+  ASSERT_EQ(r, UV_EBADF);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_openat(NULL, &req, dirfd, "file", UV_FS_O_RDONLY, 0, NULL);
+  ASSERT_GE(r, 0);
+  fd = r;
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, fd, "file", 0, NULL);
+  ASSERT_EQ(r, UV_ENOTDIR);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_unlinkat(NULL, &req, fd, "file", 0, NULL);
+  ASSERT_EQ(r, UV_ENOTDIR);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_close(NULL, &req, fd, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  /* dirfd follows the directory, not its name. */
+  r = uv_fs_rename(NULL, &req, "test_dir", "test_dir_moved", NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_unlinkat(NULL, &req, dirfd, "renamed", 0, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_stat(NULL, &req, "test_dir_moved/renamed", NULL);
+  ASSERT_EQ(r, UV_ENOENT);
+  uv_fs_req_cleanup(&req);
+
+  /* Async. */
+  i = 0;
+  ASSERT_OK(uv_fs_openat(loop, &reqs[i++], dirfd, "file", UV_FS_O_RDONLY, 0,
+                         at_cb));
+  ASSERT_OK(uv_fs_statat(loop, &reqs[i++], dirfd, "file", 0, at_cb));
+  ASSERT_OK(uv_fs_mkdirat(loop, &reqs[i++], dirfd, "sub2", 0755, at_cb));
+  ASSERT_OK(uv_fs_linkat(loop, &reqs[i++], dirfd, "file", dirfd, "hard",
+                         at_cb));
+  uv_run(loop, UV_RUN_DEFAULT);
+  ASSERT_EQ(at_cb_count, i);
+
+  i = 0;
+  ASSERT_OK(uv_fs_renameat(loop, &reqs[i++], dirfd, "hard", dirfd, "hard2",
+                           at_cb));
+  ASSERT_OK(uv_fs_unlinkat(loop, &reqs[i++], dirfd, "sub2", UV_FS_AT_REMOVEDIR,
+                           at_cb));
+  ASSERT_OK(uv_fs_unlinkat(loop, &reqs[i++], dirfd, "sub", UV_FS_AT_REMOVEDIR,
+                           at_cb));
+  uv_run(loop, UV_RUN_DEFAULT);
+  ASSERT_EQ(at_cb_count, 4 + i);
+
+  r = uv_fs_unlinkat(NULL, &req, dirfd, "hard2", 0, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  /* Symlinks. */
+  r = uv_fs_symlinkat(NULL, &req, "file", dirfd, "link", 0, NULL);
+#ifdef _WIN32
+  ASSERT_EQ(r, UV_ENOTSUP);
+  uv_fs_req_cleanup(&req);
+  r = uv_fs_symlink(NULL, &req, "file", "test_dir_moved/link", 0, NULL);
+  if (r == UV_EPERM)
+    RETURN_SKIP("Creating symlinks requires elevated privileges");
+#endif
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_readlinkat(NULL, &req, dirfd, "link", NULL);
+  ASSERT_OK(r);
+  ASSERT_OK(strcmp(req.ptr, "file"));
+  uv_fs_req_cleanup(&req);
+
+  /* UV_FS_AT_SYMLINK_NOFOLLOW selects lstat. */
+  r = uv_fs_statat(NULL, &req, dirfd, "link", 0, NULL);
+  ASSERT_OK(r);
+  ASSERT_EQ(req.fs_type, UV_FS_STAT);
+  s = req.ptr;
+  ASSERT_EQ(s->st_mode & S_IFMT, S_IFREG);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_statat(NULL, &req, dirfd, "link", UV_FS_AT_SYMLINK_NOFOLLOW, NULL);
+  ASSERT_OK(r);
+  ASSERT_EQ(req.fs_type, UV_FS_LSTAT);
+  s = req.ptr;
+  ASSERT_EQ(s->st_mode & S_IFMT, S_IFLNK);
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_unlinkat(NULL, &req, dirfd, "link", 0, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  /* Cleanup. */
+  r = uv_fs_close(NULL, &req, dirfd, NULL);
+  ASSERT_OK(r);
+  uv_fs_req_cleanup(&req);
+
+  unlink("test_dir_moved/file");
+  rmdir("test_dir_moved");
 
   MAKE_VALGRIND_HAPPY(loop);
   return 0;

@@ -87,10 +87,30 @@
 extern char *mkdtemp(char *template); /* See issue #740 on AIX < 7 */
 #endif
 
+/* For syscalls without a *at() form: fail unless dirfd is the cwd. */
+#define UV__AT(d, call)                                                       \
+  ((d) == UV_FS_AT_FDCWD ? (call) : (errno = ENOSYS, -1))
+
 #if defined(__MVS__)
-/* No openat(). Only dirfd == UV_FS_AT_FDCWD is supported. */
-# define openat(d, p, f, m)                                                   \
-    ((d) == UV_FS_AT_FDCWD ? open(p, f, m) : (errno = ENOSYS, -1))
+/* No *at() family. */
+# ifndef AT_REMOVEDIR
+#  define AT_REMOVEDIR           UV_FS_AT_REMOVEDIR
+# endif
+# ifndef AT_SYMLINK_NOFOLLOW
+#  define AT_SYMLINK_NOFOLLOW    UV_FS_AT_SYMLINK_NOFOLLOW
+# endif
+# define openat(d, p, f, m)      UV__AT(d, open(p, f, m))
+# define mkdirat(d, p, m)        UV__AT(d, mkdir(p, m))
+# define unlinkat(d, p, f)       UV__AT(d, (f) ? rmdir(p) : unlink(p))
+# define renameat(d, p, e, q)    UV__AT(d, UV__AT(e, rename(p, q)))
+# define linkat(d, p, e, q, f)   UV__AT(d, UV__AT(e, link(p, q)))
+# define symlinkat(t, e, q)      UV__AT(e, symlink(t, q))
+# define readlinkat(d, p, b, n)  UV__AT(d, os390_readlink(p, b, n))
+# define fstatat(d, p, b, f)     UV__AT(d, (f) ? lstat(p, b) : stat(p, b))
+# define fchmodat(d, p, m, f)    UV__AT(d, chmod(p, m))
+# define fchownat(d, p, u, g, f)                                              \
+    UV__AT(d, (f) ? lchown(p, u, g) : chown(p, u, g))
+# define faccessat(d, p, m, f)   UV__AT(d, access(p, m))
 #endif
 
 #define INIT(subtype)                                                         \
@@ -767,7 +787,7 @@ static int uv__fs_readlink(uv_fs_t* req) {
   /* We may not have a real PATH_MAX.  Read size of link.  */
   struct stat st;
   int ret;
-  ret = uv__lstat(req->path, &st);
+  ret = fstatat(req->file, req->path, &st, AT_SYMLINK_NOFOLLOW);
   if (ret != 0)
     return -1;
   if (!S_ISLNK(st.st_mode)) {
@@ -790,11 +810,7 @@ static int uv__fs_readlink(uv_fs_t* req) {
     return -1;
   }
 
-#if defined(__MVS__)
-  len = os390_readlink(req->path, buf, maxlen);
-#else
-  len = readlink(req->path, buf, maxlen);
-#endif
+  len = readlinkat(req->file, req->path, buf, maxlen);
 
   if (len == -1) {
     uv__free(buf);
@@ -1177,12 +1193,12 @@ static int uv__fs_utime(uv_fs_t* req) {
   struct timespec ts[2];
   ts[0] = uv__fs_to_timespec(req->atime);
   ts[1] = uv__fs_to_timespec(req->mtime);
-  return utimensat(AT_FDCWD, req->path, ts, 0);
+  return utimensat(req->file, req->path, ts, 0);
 #elif defined(_AIX) && !defined(_AIX71)
   struct utimbuf buf;
   buf.actime = req->atime;
   buf.modtime = req->mtime;
-  return utime(req->path, &buf);
+  return UV__AT(req->file, utime(req->path, &buf));
 #elif defined(__MVS__)
   attrib_t atr;
   memset(&atr, 0, sizeof(atr));
@@ -1190,7 +1206,7 @@ static int uv__fs_utime(uv_fs_t* req) {
   atr.att_atimechg = 1;
   atr.att_mtime = req->mtime;
   atr.att_atime = req->atime;
-  return __lchattr((char*) req->path, &atr, sizeof(atr));
+  return UV__AT(req->file, __lchattr((char*) req->path, &atr, sizeof(atr)));
 #else
   errno = ENOSYS;
   return -1;
@@ -1212,7 +1228,7 @@ static int uv__fs_lutime(uv_fs_t* req) {
   struct timespec ts[2];
   ts[0] = uv__fs_to_timespec(req->atime);
   ts[1] = uv__fs_to_timespec(req->mtime);
-  return utimensat(AT_FDCWD, req->path, ts, AT_SYMLINK_NOFOLLOW);
+  return utimensat(req->file, req->path, ts, AT_SYMLINK_NOFOLLOW);
 #else
   errno = ENOSYS;
   return -1;
@@ -1540,7 +1556,6 @@ static int uv__fs_statx(int fd,
 #ifdef __linux__
   static _Atomic int no_statx;
   struct uv__statx statxbuf;
-  int dirfd;
   int flags;
   int mode;
   int rc;
@@ -1548,19 +1563,16 @@ static int uv__fs_statx(int fd,
   if (atomic_load_explicit(&no_statx, memory_order_relaxed))
     return UV_ENOSYS;
 
-  dirfd = AT_FDCWD;
   flags = 0; /* AT_STATX_SYNC_AS_STAT */
   mode = 0xFFF; /* STATX_BASIC_STATS + STATX_BTIME */
 
-  if (is_fstat) {
-    dirfd = fd;
+  if (is_fstat)
     flags |= 0x1000; /* AT_EMPTY_PATH */
-  }
 
   if (is_lstat)
     flags |= AT_SYMLINK_NOFOLLOW;
 
-  rc = uv__statx(dirfd, path, flags, mode, &statxbuf);
+  rc = uv__statx(fd, path, flags, mode, &statxbuf);
 
   switch (rc) {
   case 0:
@@ -1592,33 +1604,19 @@ static int uv__fs_statx(int fd,
 }
 
 
-static int uv__fs_stat(const char *path, uv_stat_t *buf) {
+static int uv__fs_stat(int dirfd, const char* path, int flags, uv_stat_t* buf) {
   struct stat pbuf;
   int ret;
 
-  ret = uv__fs_statx(-1, path, /* is_fstat */ 0, /* is_lstat */ 0, buf);
+  ret = uv__fs_statx(dirfd, path, /* is_fstat */ 0, flags, buf);
   if (ret != UV_ENOSYS)
     return ret;
 
-  ret = uv__stat(path, &pbuf);
-  if (ret == 0)
+  ret = fstatat(dirfd, path, &pbuf, flags);
+  if (ret == 0) {
+    uv__msan_unpoison(&pbuf, sizeof(pbuf));
     uv__to_stat(&pbuf, buf);
-
-  return ret;
-}
-
-
-static int uv__fs_lstat(const char *path, uv_stat_t *buf) {
-  struct stat pbuf;
-  int ret;
-
-  ret = uv__fs_statx(-1, path, /* is_fstat */ 0, /* is_lstat */ 1, buf);
-  if (ret != UV_ENOSYS)
-    return ret;
-
-  ret = uv__lstat(path, &pbuf);
-  if (ret == 0)
-    uv__to_stat(&pbuf, buf);
+  }
 
   return ret;
 }
@@ -1717,23 +1715,25 @@ static void uv__fs_work(struct uv__work* w) {
     break;
 
     switch (req->fs_type) {
-    X(ACCESS, access(req->path, req->flags));
-    X(CHMOD, chmod(req->path, req->mode));
-    X(CHOWN, chown(req->path, req->uid, req->gid));
+    X(ACCESS, faccessat(req->file, req->path, req->flags, 0));
+    X(CHMOD, fchmodat(req->file, req->path, req->mode, 0));
+    X(CHOWN, fchownat(req->file, req->path, req->uid, req->gid, 0));
     X(CLOSE, uv__fs_close(req->file));
     X(COPYFILE, uv__fs_copyfile(req));
     X(FCHMOD, fchmod(req->file, req->mode));
     X(FCHOWN, fchown(req->file, req->uid, req->gid));
-    X(LCHOWN, lchown(req->path, req->uid, req->gid));
+    X(LCHOWN, fchownat(req->file, req->path, req->uid, req->gid,
+                       AT_SYMLINK_NOFOLLOW));
     X(FDATASYNC, uv__fs_fdatasync(req));
     X(FSTAT, uv__fs_fstat(req->file, &req->statbuf));
     X(FSYNC, uv__fs_fsync(req));
     X(FTRUNCATE, ftruncate(req->file, req->off));
     X(FUTIME, uv__fs_futime(req));
     X(LUTIME, uv__fs_lutime(req));
-    X(LSTAT, uv__fs_lstat(req->path, &req->statbuf));
-    X(LINK, link(req->path, req->new_path));
-    X(MKDIR, mkdir(req->path, req->mode));
+    X(LSTAT, uv__fs_stat(req->file, req->path, AT_SYMLINK_NOFOLLOW,
+                         &req->statbuf));
+    X(LINK, linkat(req->file, req->path, req->flags, req->new_path, 0));
+    X(MKDIR, mkdirat(req->file, req->path, req->mode));
     X(MKDTEMP, uv__fs_mkdtemp(req));
     X(MKSTEMP, uv__fs_mkstemp(req));
     X(OPEN, uv__fs_open(req));
@@ -1744,13 +1744,13 @@ static void uv__fs_work(struct uv__work* w) {
     X(CLOSEDIR, uv__fs_closedir(req));
     X(READLINK, uv__fs_readlink(req));
     X(REALPATH, uv__fs_realpath(req));
-    X(RENAME, rename(req->path, req->new_path));
-    X(RMDIR, rmdir(req->path));
+    X(RENAME, renameat(req->file, req->path, req->flags, req->new_path));
+    X(RMDIR, unlinkat(req->file, req->path, AT_REMOVEDIR));
     X(SENDFILE, uv__fs_sendfile(req));
-    X(STAT, uv__fs_stat(req->path, &req->statbuf));
+    X(STAT, uv__fs_stat(req->file, req->path, 0, &req->statbuf));
     X(STATFS, uv__fs_statfs(req));
-    X(SYMLINK, symlink(req->path, req->new_path));
-    X(UNLINK, unlink(req->path));
+    X(SYMLINK, symlinkat(req->path, req->file, req->new_path));
+    X(UNLINK, unlinkat(req->file, req->path, 0));
     X(UTIME, uv__fs_utime(req));
     X(WRITE, uv__fs_write_all(req));
     default: abort();
@@ -1801,9 +1801,20 @@ int uv_fs_access(uv_loop_t* loop,
                  const char* path,
                  int flags,
                  uv_fs_cb cb) {
+  return uv_fs_accessat(loop, req, UV_FS_AT_FDCWD, path, flags, cb);
+}
+
+
+int uv_fs_accessat(uv_loop_t* loop,
+                   uv_fs_t* req,
+                   uv_file dirfd,
+                   const char* path,
+                   int mode,
+                   uv_fs_cb cb) {
   INIT(ACCESS);
   PATH;
-  req->flags = flags;
+  req->file = dirfd;
+  req->flags = mode;
   POST;
 }
 
@@ -1813,8 +1824,19 @@ int uv_fs_chmod(uv_loop_t* loop,
                 const char* path,
                 int mode,
                 uv_fs_cb cb) {
+  return uv_fs_chmodat(loop, req, UV_FS_AT_FDCWD, path, mode, cb);
+}
+
+
+int uv_fs_chmodat(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_file dirfd,
+                  const char* path,
+                  int mode,
+                  uv_fs_cb cb) {
   INIT(CHMOD);
   PATH;
+  req->file = dirfd;
   req->mode = mode;
   POST;
 }
@@ -1826,8 +1848,25 @@ int uv_fs_chown(uv_loop_t* loop,
                 uv_uid_t uid,
                 uv_gid_t gid,
                 uv_fs_cb cb) {
+  return uv_fs_chownat(loop, req, UV_FS_AT_FDCWD, path, uid, gid, 0, cb);
+}
+
+
+int uv_fs_chownat(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_file dirfd,
+                  const char* path,
+                  uv_uid_t uid,
+                  uv_gid_t gid,
+                  int flags,
+                  uv_fs_cb cb) {
   INIT(CHOWN);
+  if (flags & ~UV_FS_AT_SYMLINK_NOFOLLOW)
+    return UV_EINVAL;
+  if (flags)
+    req->fs_type = UV_FS_LCHOWN;
   PATH;
+  req->file = dirfd;
   req->uid = uid;
   req->gid = gid;
   POST;
@@ -1876,11 +1915,14 @@ int uv_fs_lchown(uv_loop_t* loop,
                  uv_uid_t uid,
                  uv_gid_t gid,
                  uv_fs_cb cb) {
-  INIT(LCHOWN);
-  PATH;
-  req->uid = uid;
-  req->gid = gid;
-  POST;
+  return uv_fs_chownat(loop,
+                       req,
+                       UV_FS_AT_FDCWD,
+                       path,
+                       uid,
+                       gid,
+                       UV_FS_AT_SYMLINK_NOFOLLOW,
+                       cb);
 }
 
 
@@ -1948,21 +1990,24 @@ int uv_fs_lutime(uv_loop_t* loop,
                  double atime,
                  double mtime,
                  uv_fs_cb cb) {
-  INIT(LUTIME);
-  PATH;
-  req->atime = atime;
-  req->mtime = mtime;
-  POST;
+  return uv_fs_utimeat(loop,
+                       req,
+                       UV_FS_AT_FDCWD,
+                       path,
+                       atime,
+                       mtime,
+                       UV_FS_AT_SYMLINK_NOFOLLOW,
+                       cb);
 }
 
 
 int uv_fs_lstat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
-  INIT(LSTAT);
-  PATH;
-  if (cb != NULL)
-    if (uv__iou_fs_statx(loop, req, /* is_fstat */ 0, /* is_lstat */ 1))
-      return 0;
-  POST;
+  return uv_fs_statat(loop,
+                      req,
+                      UV_FS_AT_FDCWD,
+                      path,
+                      UV_FS_AT_SYMLINK_NOFOLLOW,
+                      cb);
 }
 
 
@@ -1971,8 +2016,27 @@ int uv_fs_link(uv_loop_t* loop,
                const char* path,
                const char* new_path,
                uv_fs_cb cb) {
+  return uv_fs_linkat(loop,
+                      req,
+                      UV_FS_AT_FDCWD,
+                      path,
+                      UV_FS_AT_FDCWD,
+                      new_path,
+                      cb);
+}
+
+
+int uv_fs_linkat(uv_loop_t* loop,
+                 uv_fs_t* req,
+                 uv_file dirfd,
+                 const char* path,
+                 uv_file new_dirfd,
+                 const char* new_path,
+                 uv_fs_cb cb) {
   INIT(LINK);
   PATH2;
+  req->file = dirfd;
+  req->flags = new_dirfd;
   if (cb != NULL)
     if (uv__iou_fs_link(loop, req))
       return 0;
@@ -1985,8 +2049,19 @@ int uv_fs_mkdir(uv_loop_t* loop,
                 const char* path,
                 int mode,
                 uv_fs_cb cb) {
+  return uv_fs_mkdirat(loop, req, UV_FS_AT_FDCWD, path, mode, cb);
+}
+
+
+int uv_fs_mkdirat(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_file dirfd,
+                  const char* path,
+                  int mode,
+                  uv_fs_cb cb) {
   INIT(MKDIR);
   PATH;
+  req->file = dirfd;
   req->mode = mode;
   if (cb != NULL)
     if (uv__iou_fs_mkdir(loop, req))
@@ -2134,8 +2209,18 @@ int uv_fs_readlink(uv_loop_t* loop,
                    uv_fs_t* req,
                    const char* path,
                    uv_fs_cb cb) {
+  return uv_fs_readlinkat(loop, req, UV_FS_AT_FDCWD, path, cb);
+}
+
+
+int uv_fs_readlinkat(uv_loop_t* loop,
+                     uv_fs_t* req,
+                     uv_file dirfd,
+                     const char* path,
+                     uv_fs_cb cb) {
   INIT(READLINK);
   PATH;
+  req->file = dirfd;
   POST;
 }
 
@@ -2155,8 +2240,27 @@ int uv_fs_rename(uv_loop_t* loop,
                  const char* path,
                  const char* new_path,
                  uv_fs_cb cb) {
+  return uv_fs_renameat(loop,
+                        req,
+                        UV_FS_AT_FDCWD,
+                        path,
+                        UV_FS_AT_FDCWD,
+                        new_path,
+                        cb);
+}
+
+
+int uv_fs_renameat(uv_loop_t* loop,
+                   uv_fs_t* req,
+                   uv_file dirfd,
+                   const char* path,
+                   uv_file new_dirfd,
+                   const char* new_path,
+                   uv_fs_cb cb) {
   INIT(RENAME);
   PATH2;
+  req->file = dirfd;
+  req->flags = new_dirfd;
   if (cb != NULL)
     if (uv__iou_fs_rename(loop, req))
       return 0;
@@ -2165,9 +2269,12 @@ int uv_fs_rename(uv_loop_t* loop,
 
 
 int uv_fs_rmdir(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
-  INIT(RMDIR);
-  PATH;
-  POST;
+  return uv_fs_unlinkat(loop,
+                        req,
+                        UV_FS_AT_FDCWD,
+                        path,
+                        UV_FS_AT_REMOVEDIR,
+                        cb);
 }
 
 
@@ -2190,10 +2297,25 @@ int uv_fs_sendfile(uv_loop_t* loop,
 
 
 int uv_fs_stat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
+  return uv_fs_statat(loop, req, UV_FS_AT_FDCWD, path, 0, cb);
+}
+
+
+int uv_fs_statat(uv_loop_t* loop,
+                 uv_fs_t* req,
+                 uv_file dirfd,
+                 const char* path,
+                 int flags,
+                 uv_fs_cb cb) {
   INIT(STAT);
+  if (flags & ~UV_FS_AT_SYMLINK_NOFOLLOW)
+    return UV_EINVAL;
+  if (flags)
+    req->fs_type = UV_FS_LSTAT;
   PATH;
+  req->file = dirfd;
   if (cb != NULL)
-    if (uv__iou_fs_statx(loop, req, /* is_fstat */ 0, /* is_lstat */ 0))
+    if (uv__iou_fs_statx(loop, req, /* is_fstat */ 0, flags))
       return 0;
   POST;
 }
@@ -2205,8 +2327,26 @@ int uv_fs_symlink(uv_loop_t* loop,
                   const char* new_path,
                   int flags,
                   uv_fs_cb cb) {
+  return uv_fs_symlinkat(loop,
+                         req,
+                         path,
+                         UV_FS_AT_FDCWD,
+                         new_path,
+                         flags,
+                         cb);
+}
+
+
+int uv_fs_symlinkat(uv_loop_t* loop,
+                    uv_fs_t* req,
+                    const char* path,
+                    uv_file new_dirfd,
+                    const char* new_path,
+                    int flags,
+                    uv_fs_cb cb) {
   INIT(SYMLINK);
   PATH2;
+  req->file = new_dirfd;
   req->flags = flags;
   if (cb != NULL)
     if (uv__iou_fs_symlink(loop, req))
@@ -2216,9 +2356,24 @@ int uv_fs_symlink(uv_loop_t* loop,
 
 
 int uv_fs_unlink(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
+  return uv_fs_unlinkat(loop, req, UV_FS_AT_FDCWD, path, 0, cb);
+}
+
+
+int uv_fs_unlinkat(uv_loop_t* loop,
+                   uv_fs_t* req,
+                   uv_file dirfd,
+                   const char* path,
+                   int flags,
+                   uv_fs_cb cb) {
   INIT(UNLINK);
+  if (flags & ~UV_FS_AT_REMOVEDIR)
+    return UV_EINVAL;
+  if (flags)
+    req->fs_type = UV_FS_RMDIR;
   PATH;
-  if (cb != NULL)
+  req->file = dirfd;
+  if (cb != NULL && flags == 0)
     if (uv__iou_fs_unlink(loop, req))
       return 0;
   POST;
@@ -2231,8 +2386,25 @@ int uv_fs_utime(uv_loop_t* loop,
                 double atime,
                 double mtime,
                 uv_fs_cb cb) {
+  return uv_fs_utimeat(loop, req, UV_FS_AT_FDCWD, path, atime, mtime, 0, cb);
+}
+
+
+int uv_fs_utimeat(uv_loop_t* loop,
+                  uv_fs_t* req,
+                  uv_file dirfd,
+                  const char* path,
+                  double atime,
+                  double mtime,
+                  int flags,
+                  uv_fs_cb cb) {
   INIT(UTIME);
+  if (flags & ~UV_FS_AT_SYMLINK_NOFOLLOW)
+    return UV_EINVAL;
+  if (flags)
+    req->fs_type = UV_FS_LUTIME;
   PATH;
+  req->file = dirfd;
   req->atime = atime;
   req->mtime = mtime;
   POST;

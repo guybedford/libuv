@@ -28,6 +28,8 @@
 /* Ntdll function pointers */
 sRtlGetVersion pRtlGetVersion;
 sRtlNtStatusToDosError pRtlNtStatusToDosError;
+sRtlDosPathNameToNtPathName_U pRtlDosPathNameToNtPathName_U;
+sRtlFreeUnicodeString pRtlFreeUnicodeString;
 sNtDeviceIoControlFile pNtDeviceIoControlFile;
 sNtCreateFile pNtCreateFile;
 sNtQueryInformationFile pNtQueryInformationFile;
@@ -64,6 +66,8 @@ void uv__winapi_init(void) {
     FARPROC proc;
     sRtlGetVersion pRtlGetVersion;
     sRtlNtStatusToDosError pRtlNtStatusToDosError;
+    sRtlDosPathNameToNtPathName_U pRtlDosPathNameToNtPathName_U;
+    sRtlFreeUnicodeString pRtlFreeUnicodeString;
     sNtDeviceIoControlFile pNtDeviceIoControlFile;
     sNtCreateFile pNtCreateFile;
     sNtQueryInformationFile pNtQueryInformationFile;
@@ -90,6 +94,18 @@ void uv__winapi_init(void) {
   u.proc = GetProcAddress(ntdll_module, "RtlNtStatusToDosError");
   pRtlNtStatusToDosError = u.pRtlNtStatusToDosError;
   if (pRtlNtStatusToDosError == NULL) {
+    uv_fatal_error(GetLastError(), "GetProcAddress");
+  }
+
+  u.proc = GetProcAddress(ntdll_module, "RtlDosPathNameToNtPathName_U");
+  pRtlDosPathNameToNtPathName_U = u.pRtlDosPathNameToNtPathName_U;
+  if (pRtlDosPathNameToNtPathName_U == NULL) {
+    uv_fatal_error(GetLastError(), "GetProcAddress");
+  }
+
+  u.proc = GetProcAddress(ntdll_module, "RtlFreeUnicodeString");
+  pRtlFreeUnicodeString = u.pRtlFreeUnicodeString;
+  if (pRtlFreeUnicodeString == NULL) {
     uv_fatal_error(GetLastError(), "GetProcAddress");
   }
 

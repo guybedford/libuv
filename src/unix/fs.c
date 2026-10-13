@@ -369,16 +369,54 @@ clobber:
 }
 
 
+/* Whether `path` stays under its starting directory as written: not absolute
+ * and no ".." climbing above it. Symlink targets are not inspected. */
+static int uv__fs_path_beneath(const char* path) {
+  const char* p;
+  size_t n;
+  int depth;
+
+  if (path[0] == '/')
+    return 0;
+
+  depth = 0;
+  for (p = path; *p != '\0'; p += strspn(p, "/")) {
+    n = strcspn(p, "/");
+    if (n == 2 && p[0] == '.' && p[1] == '.') {
+      if (depth == 0)
+        return 0;
+      depth--;
+    } else if (n != 1 || p[0] != '.') {
+      depth++;
+    }
+    p += n;
+  }
+
+  return 1;
+}
+
+
+static int uv__fs_openat(int dirfd, const char* path, int flags, int mode) {
+  if (flags & UV_FS_O_RESOLVE_BENEATH) {
+    flags &= ~UV_FS_O_RESOLVE_BENEATH;
+    if (!uv__fs_path_beneath(path))
+      return errno = EXDEV, -1;
+  }
+
+  return openat(dirfd, path, flags, mode);
+}
+
+
 static int uv__fs_open(uv_fs_t* req) {
 #ifdef O_CLOEXEC
-  return openat(req->file, req->path, req->flags | O_CLOEXEC, req->mode);
+  return uv__fs_openat(req->file, req->path, req->flags | O_CLOEXEC, req->mode);
 #else  /* O_CLOEXEC */
   int r;
 
   if (req->cb != NULL)
     uv_rwlock_rdlock(&req->loop->cloexec_lock);
 
-  r = openat(req->file, req->path, req->flags, req->mode);
+  r = uv__fs_openat(req->file, req->path, req->flags, req->mode);
 
   /* In case of failure `uv__cloexec` will leave error in `errno`,
    * so it is enough to just set `r` to `-1`.

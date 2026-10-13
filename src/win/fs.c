@@ -470,9 +470,10 @@ static int fs__is_dos_device_name(const WCHAR* s, size_t len) {
  * trailing separator is kept.
  *
  * Returns the new length, or -1 with the last error set, for a ".." that
- * would climb above the root, a component that is empty once stripped, or a
- * DOS device name, none of which Win32 can express in a directory. */
-static int fs__normalize_at_path(WCHAR* path) {
+ * would climb above the root (ERROR_NOT_SAME_DEVICE when `beneath`), a
+ * component that is empty once stripped, or a DOS device name, none of which
+ * Win32 can express in a directory. */
+static int fs__normalize_at_path(WCHAR* path, int beneath) {
   WCHAR* start;
   WCHAR* name;
   WCHAR* end;
@@ -510,8 +511,12 @@ static int fs__normalize_at_path(WCHAR* path) {
       continue;
     if (end - name != 2 || name[0] != L'.' || name[1] != L'.')
       goto invalid;
-    if (q == path)
-      goto invalid;
+    if (q == path) {
+      if (!beneath)
+        goto invalid;
+      SetLastError(ERROR_NOT_SAME_DEVICE);
+      return -1;
+    }
     while (q > path && q[-1] != L'\\')
       q--;
     if (q > path)
@@ -530,14 +535,16 @@ invalid:
 
 
 /* CreateFileW(), with a relative path resolved against the directory open at
- * dirfd rather than the cwd. Modifies `path` in place, see
- * fs__normalize_at_path(). */
+ * dirfd rather than the cwd. With `beneath`, a path that would resolve
+ * outside it fails with ERROR_NOT_SAME_DEVICE instead. Modifies `path` in
+ * place, see fs__normalize_at_path(). */
 static HANDLE fs__create_file(int dirfd,
                               WCHAR* path,
                               DWORD access,
                               DWORD share,
                               DWORD disposition,
-                              DWORD flags) {
+                              DWORD flags,
+                              int beneath) {
   FILE_STANDARD_INFO info;
   OBJECT_ATTRIBUTES attr;
   UNICODE_STRING name;
@@ -547,7 +554,7 @@ static HANDLE fs__create_file(int dirfd,
   ULONG options;
   int len;
 
-  if (dirfd == UV_FS_AT_FDCWD)
+  if (dirfd == UV_FS_AT_FDCWD && !beneath)
     return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
 
   if (path[0] == L'\0') {
@@ -558,16 +565,35 @@ static HANDLE fs__create_file(int dirfd,
   /* A fully qualified path (C:\foo, \\server\share, \\?\...) ignores dirfd,
    * as an absolute path does on UNIX. */
   if ((IS_SLASH(path[0]) && IS_SLASH(path[1])) ||
-      (path[1] == L':' && IS_SLASH(path[2])))
-    return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+      (path[1] == L':' && IS_SLASH(path[2]))) {
+    if (!beneath)
+      return CreateFileW(path, access, share, NULL, disposition, flags, NULL);
+    SetLastError(ERROR_NOT_SAME_DEVICE);
+    return INVALID_HANDLE_VALUE;
+  }
 
   /* A rooted (\foo) or drive-relative (C:foo) path resolves against the
    * process-wide current drive or per-drive directory, which has no meaning
    * relative to dirfd. */
   if (IS_SLASH(path[0]) || path[1] == L':') {
-    SetLastError(ERROR_INVALID_PARAMETER);
+    SetLastError(beneath ? ERROR_NOT_SAME_DEVICE : ERROR_INVALID_PARAMETER);
     return INVALID_HANDLE_VALUE;
   }
+
+  len = fs__normalize_at_path(path, beneath);
+  if (len < 0)
+    return INVALID_HANDLE_VALUE;
+
+  /* The cwd has no handle to resolve under; "." stands in for the empty
+   * name that NtCreateFile() takes to mean the root itself. */
+  if (dirfd == UV_FS_AT_FDCWD)
+    return CreateFileW(len == 0 ? L"." : path,
+                       access,
+                       share,
+                       NULL,
+                       disposition,
+                       flags,
+                       NULL);
 
   handle = uv__get_osfhandle(dirfd);
   if (handle == INVALID_HANDLE_VALUE) {
@@ -585,10 +611,6 @@ static HANDLE fs__create_file(int dirfd,
     SetLastError(ERROR_DIRECTORY);
     return INVALID_HANDLE_VALUE;
   }
-
-  len = fs__normalize_at_path(path);
-  if (len < 0)
-    return INVALID_HANDLE_VALUE;
 
   status = uv__RtlUnicodeStringInit(&name, path, len);
   if (!NT_SUCCESS(status)) {
@@ -822,7 +844,8 @@ void fs__open(uv_fs_t* req) {
                          access,
                          share,
                          disposition,
-                         attributes);
+                         attributes,
+                         flags & UV_FS_O_RESOLVE_BENEATH);
   if (file == INVALID_HANDLE_VALUE) {
     DWORD error = GetLastError();
     if (error == ERROR_FILE_EXISTS && (flags & UV_FS_O_CREAT) &&

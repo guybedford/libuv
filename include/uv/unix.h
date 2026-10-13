@@ -511,6 +511,9 @@ struct uv__req_write_extra_s {
 # define UV_FS_AT_FDCWD       (-100)
 #endif
 
+/* uv_fs_openat() resolution flags, consumed by libuv, not passed to open(). */
+#define UV_FS_O_RESOLVE_BENEATH 0x10000000
+
 /* fs open() flags supported on other platforms: */
 #define UV_FS_O_FILEMAP       0
 #define UV_FS_O_RANDOM        0

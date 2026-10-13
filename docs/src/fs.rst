@@ -251,6 +251,7 @@ API
 
     `dirfd` is not a boundary and an absolute `path` or backtracking `..`
     or symbolic link can all resolve to a file outside of the directory.
+    See :c:macro:`UV_FS_O_RESOLVE_BENEATH` to constrain the path.
 
     `dirfd` must remain open until the request completes. A `dirfd` that is
     not open fails with ``UV_EBADF``; one that is not a directory fails with
@@ -732,6 +733,17 @@ File open constants
     .. note::
         `UV_FS_O_SHORT_LIVED` is only supported on Windows via
         `FILE_ATTRIBUTE_TEMPORARY <https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew>`_.
+
+.. c:macro:: UV_FS_O_RESOLVE_BENEATH
+
+    For :c:func:`uv_fs_openat`: the path as written must stay under `dirfd`
+    (or the current working directory for ``UV_FS_AT_FDCWD``). An absolute
+    path, or a ``..`` component that would climb above it, fails with
+    ``UV_EXDEV``. Only the path is checked: symbolic links are followed and
+    may point anywhere, and a directory concurrently renamed out of `dirfd`
+    is not detected, so the contents of `dirfd` must be trusted.
+
+    .. versionadded:: 1.54.0
 
 .. c:macro:: UV_FS_O_SYMLINK
 

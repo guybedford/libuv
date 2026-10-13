@@ -481,6 +481,17 @@ static void openat_cb(uv_fs_t* req) {
 }
 
 
+static int openat_result;
+
+static void openat_result_cb(uv_fs_t* req) {
+  ASSERT_EQ(req->fs_type, UV_FS_OPEN);
+  openat_result = req->result;
+  if (req->result >= 0)
+    close(req->result);
+  uv_fs_req_cleanup(req);
+}
+
+
 /* Opens and closes, returning 0 or the open error. */
 static int openat_sync(uv_file dirfd, const char* path, int flags) {
   uv_fs_t req;
@@ -3741,6 +3752,136 @@ TEST_FS_IMPL(fs_openat) {
   unlink("test_dir_moved/sub/file");
   rmdir("test_dir_moved/sub");
   rmdir("test_dir_moved");
+
+  MAKE_VALGRIND_HAPPY(loop);
+  return 0;
+}
+
+
+TEST_FS_IMPL(fs_openat_beneath) {
+  char cwd[PATHMAX];
+  char path[PATHMAX + 32];
+  uv_fs_t req;
+  uv_file dirfd;
+  size_t len;
+  int flags;
+  int r;
+
+  flags = UV_FS_O_RDONLY | UV_FS_O_RESOLVE_BENEATH;
+
+  /* Setup. */
+  unlink("test_dir/file");
+  unlink("test_dir/sub/file");
+  unlink("test_dir/link");
+  unlink("test_dir/link_out");
+  rmdir("test_dir/sub");
+  rmdir("test_dir");
+  unlink("test_file_outside");
+
+  loop = uv_default_loop();
+
+  ASSERT_OK(uv_fs_mkdir(NULL, &req, "test_dir", 0755, NULL));
+  uv_fs_req_cleanup(&req);
+  ASSERT_OK(uv_fs_mkdir(NULL, &req, "test_dir/sub", 0755, NULL));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_open(NULL, &req, "test_dir/file",
+                 UV_FS_O_WRONLY | UV_FS_O_CREAT, S_IWUSR | S_IRUSR, NULL);
+  ASSERT_GE(r, 0);
+  uv_fs_req_cleanup(&req);
+  ASSERT_OK(uv_fs_close(NULL, &req, r, NULL));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_open(NULL, &req, "test_dir/sub/file",
+                 UV_FS_O_WRONLY | UV_FS_O_CREAT, S_IWUSR | S_IRUSR, NULL);
+  ASSERT_GE(r, 0);
+  uv_fs_req_cleanup(&req);
+  ASSERT_OK(uv_fs_close(NULL, &req, r, NULL));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_open(NULL, &req, "test_file_outside",
+                 UV_FS_O_WRONLY | UV_FS_O_CREAT, S_IWUSR | S_IRUSR, NULL);
+  ASSERT_GE(r, 0);
+  uv_fs_req_cleanup(&req);
+  ASSERT_OK(uv_fs_close(NULL, &req, r, NULL));
+  uv_fs_req_cleanup(&req);
+
+  r = uv_fs_open(NULL, &req, "test_dir", UV_FS_O_RDONLY | UV_FS_O_DIRECTORY, 0,
+                 NULL);
+  ASSERT_GE(r, 0);
+  dirfd = r;
+  uv_fs_req_cleanup(&req);
+
+  len = sizeof(cwd);
+  ASSERT_OK(uv_cwd(cwd, &len));
+  snprintf(path, sizeof(path), "%s/test_dir/file", cwd);
+
+  /* The path as written stays under dirfd. */
+  ASSERT_OK(openat_sync(dirfd, "file", flags));
+  ASSERT_OK(openat_sync(dirfd, "./file", flags));
+  ASSERT_OK(openat_sync(dirfd, "sub/../file", flags));
+  ASSERT_OK(openat_sync(dirfd, "sub//file", flags));
+  ASSERT_OK(openat_sync(dirfd, ".", flags | UV_FS_O_DIRECTORY));
+  ASSERT_OK(openat_sync(dirfd, "sub/..", flags | UV_FS_O_DIRECTORY));
+  ASSERT_EQ(openat_sync(dirfd, "missing", flags), UV_ENOENT);
+
+  /* It does not. */
+  ASSERT_EQ(openat_sync(dirfd, "..", flags), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, "../test_file_outside", flags), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, "sub/../../test_file_outside", flags),
+            UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, "sub/../..", flags), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, path, flags), UV_EXDEV);
+#ifdef _WIN32
+  ASSERT_EQ(openat_sync(dirfd, "\\file", flags), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, "C:file", flags), UV_EXDEV);
+#else
+  ASSERT_EQ(openat_sync(dirfd, "/", flags), UV_EXDEV);
+#endif
+
+  /* Relative to the cwd. */
+  ASSERT_OK(openat_sync(UV_FS_AT_FDCWD, "test_dir/file", flags));
+  ASSERT_OK(openat_sync(UV_FS_AT_FDCWD, "test_dir/sub/../file", flags));
+  ASSERT_OK(openat_sync(UV_FS_AT_FDCWD, ".", flags | UV_FS_O_DIRECTORY));
+  ASSERT_EQ(openat_sync(UV_FS_AT_FDCWD, "../x", flags), UV_EXDEV);
+  ASSERT_EQ(openat_sync(UV_FS_AT_FDCWD, path, flags), UV_EXDEV);
+
+#ifndef _WIN32
+  /* Symlinks are followed wherever they point. */
+  ASSERT_OK(uv_fs_symlink(NULL, &req, "file", "test_dir/link", 0, NULL));
+  uv_fs_req_cleanup(&req);
+  ASSERT_OK(uv_fs_symlink(NULL, &req, "../test_file_outside",
+                          "test_dir/link_out", 0, NULL));
+  uv_fs_req_cleanup(&req);
+
+  ASSERT_OK(openat_sync(dirfd, "link", flags));
+  ASSERT_OK(openat_sync(dirfd, "link_out", flags));
+#endif
+
+  /* Async. */
+  r = uv_fs_openat(loop, &req, dirfd, "sub/../file", flags, 0,
+                   openat_result_cb);
+  ASSERT_OK(r);
+  uv_run(loop, UV_RUN_DEFAULT);
+  ASSERT_GE(openat_result, 0);
+
+  r = uv_fs_openat(loop, &req, dirfd, "../test_file_outside", flags, 0,
+                   openat_result_cb);
+  ASSERT_OK(r);
+  uv_run(loop, UV_RUN_DEFAULT);
+  ASSERT_EQ(openat_result, UV_EXDEV);
+
+  /* Cleanup. */
+  ASSERT_OK(uv_fs_close(NULL, &req, dirfd, NULL));
+  uv_fs_req_cleanup(&req);
+
+  unlink("test_dir/file");
+  unlink("test_dir/sub/file");
+  unlink("test_dir/link");
+  unlink("test_dir/link_out");
+  rmdir("test_dir/sub");
+  rmdir("test_dir");
+  unlink("test_file_outside");
 
   MAKE_VALGRIND_HAPPY(loop);
   return 0;

@@ -1013,6 +1013,10 @@ int uv__iou_fs_open(uv_loop_t* loop, uv_fs_t* req) {
   struct uv__io_uring_sqe* sqe;
   struct uv__iou* iou;
 
+  /* Resolution flags are handled by uv__fs_open(). */
+  if (req->flags & UV_FS_O_RESOLVE_BENEATH)
+    return 0;
+
   iou = &uv__get_internal_fields(loop)->iou;
 
   sqe = uv__iou_get_sqe(iou, loop, req);

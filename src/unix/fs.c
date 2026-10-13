@@ -397,11 +397,24 @@ static int uv__fs_path_beneath(const char* path) {
 
 
 static int uv__fs_openat(int dirfd, const char* path, int flags, int mode) {
-  if (flags & UV_FS_O_RESOLVE_BENEATH) {
-    flags &= ~UV_FS_O_RESOLVE_BENEATH;
-    if (!uv__fs_path_beneath(path))
-      return errno = EXDEV, -1;
+  int resolve;
+
+  resolve = flags & UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS;
+  if (!(resolve & UV_FS_O_RESOLVE_BENEATH))
+    return openat(dirfd, path, flags, mode);
+
+  flags &= ~resolve;
+
+  if (resolve == UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS) {
+#if defined(__linux__)
+    return uv__openat2(dirfd, path, flags, mode);
+#else
+    return errno = ENOTSUP, -1;
+#endif
   }
+
+  if (!uv__fs_path_beneath(path))
+    return errno = EXDEV, -1;
 
   return openat(dirfd, path, flags, mode);
 }

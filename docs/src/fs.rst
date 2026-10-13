@@ -251,7 +251,8 @@ API
 
     `dirfd` is not a boundary and an absolute `path` or backtracking `..`
     or symbolic link can all resolve to a file outside of the directory.
-    See :c:macro:`UV_FS_O_RESOLVE_BENEATH` to constrain the path.
+    See :c:macro:`UV_FS_O_RESOLVE_BENEATH` and
+    :c:macro:`UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS` to constrain resolution.
 
     `dirfd` must remain open until the request completes. A `dirfd` that is
     not open fails with ``UV_EBADF``; one that is not a directory fails with
@@ -742,6 +743,16 @@ File open constants
     ``UV_EXDEV``. Only the path is checked: symbolic links are followed and
     may point anywhere, and a directory concurrently renamed out of `dirfd`
     is not detected, so the contents of `dirfd` must be trusted.
+
+    .. versionadded:: 1.54.0
+
+.. c:macro:: UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS
+
+    :c:macro:`UV_FS_O_RESOLVE_BENEATH`, with resolution performed by the
+    kernel so that the contents of `dirfd` need not be trusted: a symbolic
+    link in any component of the path fails with ``UV_ELOOP``, and a
+    concurrent rename is detected. Requires :man:`openat2(2)`, Linux 5.6 or
+    later; elsewhere the open fails with ``UV_ENOTSUP``.
 
     .. versionadded:: 1.54.0
 

@@ -512,7 +512,9 @@ struct uv__req_write_extra_s {
 #endif
 
 /* uv_fs_openat() resolution flags, consumed by libuv, not passed to open(). */
-#define UV_FS_O_RESOLVE_BENEATH 0x10000000
+#define UV_FS_O_RESOLVE_BENEATH             0x10000000
+#define UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS                                 \
+  (UV_FS_O_RESOLVE_BENEATH | 0x40000000)
 
 /* fs open() flags supported on other platforms: */
 #define UV_FS_O_FILEMAP       0

@@ -3765,15 +3765,18 @@ TEST_FS_IMPL(fs_openat_beneath) {
   uv_file dirfd;
   size_t len;
   int flags;
+  int nosym;
   int r;
 
   flags = UV_FS_O_RDONLY | UV_FS_O_RESOLVE_BENEATH;
+  nosym = UV_FS_O_RDONLY | UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS;
 
   /* Setup. */
   unlink("test_dir/file");
   unlink("test_dir/sub/file");
   unlink("test_dir/link");
   unlink("test_dir/link_out");
+  unlink("test_dir/link_dir");
   rmdir("test_dir/sub");
   rmdir("test_dir");
   unlink("test_file_outside");
@@ -3858,6 +3861,33 @@ TEST_FS_IMPL(fs_openat_beneath) {
   ASSERT_OK(openat_sync(dirfd, "link_out", flags));
 #endif
 
+  /* With NO_SYMLINKS the kernel resolves, or the flag is unsupported. */
+#ifdef __linux__
+  ASSERT_OK(uv_fs_symlink(NULL, &req, "sub", "test_dir/link_dir", 0, NULL));
+  uv_fs_req_cleanup(&req);
+
+  ASSERT_OK(openat_sync(dirfd, "file", nosym));
+  ASSERT_OK(openat_sync(dirfd, "sub/../file", nosym));
+  ASSERT_OK(openat_sync(dirfd, ".", nosym | UV_FS_O_DIRECTORY));
+  ASSERT_OK(openat_sync(UV_FS_AT_FDCWD, "test_dir/file", nosym));
+  ASSERT_EQ(openat_sync(dirfd, "missing", nosym), UV_ENOENT);
+  ASSERT_EQ(openat_sync(dirfd, "..", nosym), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, "../test_file_outside", nosym), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, path, nosym), UV_EXDEV);
+  ASSERT_EQ(openat_sync(dirfd, "link", nosym), UV_ELOOP);
+  ASSERT_EQ(openat_sync(dirfd, "link_out", nosym), UV_ELOOP);
+  ASSERT_EQ(openat_sync(dirfd, "link_dir/file", nosym), UV_ELOOP);
+
+  r = uv_fs_openat(loop, &req, dirfd, "link_dir/file", nosym, 0,
+                   openat_result_cb);
+  ASSERT_OK(r);
+  uv_run(loop, UV_RUN_DEFAULT);
+  ASSERT_EQ(openat_result, UV_ELOOP);
+#else
+  ASSERT_EQ(openat_sync(dirfd, "file", nosym), UV_ENOTSUP);
+  ASSERT_EQ(openat_sync(UV_FS_AT_FDCWD, "test_dir/file", nosym), UV_ENOTSUP);
+#endif
+
   /* Async. */
   r = uv_fs_openat(loop, &req, dirfd, "sub/../file", flags, 0,
                    openat_result_cb);
@@ -3879,6 +3909,7 @@ TEST_FS_IMPL(fs_openat_beneath) {
   unlink("test_dir/sub/file");
   unlink("test_dir/link");
   unlink("test_dir/link_out");
+  unlink("test_dir/link_dir");
   rmdir("test_dir/sub");
   rmdir("test_dir");
   unlink("test_file_outside");

@@ -681,6 +681,13 @@ void fs__open(uv_fs_t* req) {
   int flags = req->fs.info.file_flags;
   struct uv__fd_info_s fd_info;
 
+  /* FILE_OPEN_REPARSE_POINT only covers the final component. */
+  if ((flags & UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS) ==
+      UV_FS_O_RESOLVE_BENEATH_NO_SYMLINKS) {
+    SET_REQ_UV_ERROR(req, UV_ENOTSUP, ERROR_NOT_SUPPORTED);
+    return;
+  }
+
   /* Adjust flags to be compatible with the memory file mapping. Save the
    * original flags to emulate the correct behavior. */
   if (flags & UV_FS_O_FILEMAP) {

@@ -115,6 +115,10 @@
 # endif
 #endif /* __NR_statx */
 
+#ifndef __NR_openat2
+# define __NR_openat2 437
+#endif
+
 #ifndef __NR_getrandom
 # if defined(__x86_64__)
 #  define __NR_getrandom 318
@@ -162,6 +166,17 @@ enum {
   UV__IORING_OP_SYMLINKAT = 38,
   UV__IORING_OP_LINKAT = 39,
   UV__IORING_OP_FTRUNCATE = 55,
+};
+
+enum {
+  UV__RESOLVE_NO_SYMLINKS = 0x04,
+  UV__RESOLVE_BENEATH = 0x08,
+};
+
+struct uv__open_how {
+  uint64_t flags;
+  uint64_t mode;
+  uint64_t resolve;
 };
 
 enum {
@@ -429,6 +444,44 @@ int uv__statx(int dirfd,
   rc = syscall(__NR_statx, dirfd, path, flags, mask, statxbuf);
   if (rc >= 0)
     uv__msan_unpoison(statxbuf, sizeof(*statxbuf));
+
+  return rc;
+#endif
+}
+
+
+/* openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS). Unlike open(), it rejects
+ * a mode without O_CREAT or O_TMPFILE and does not imply O_LARGEFILE.
+ * ENOTSUP when the kernel lacks the syscall, as on other platforms. */
+int uv__openat2(int dirfd, const char* path, int flags, int mode) {
+#if defined(__ANDROID_API__) && __ANDROID_API__ < 31
+  return errno = ENOTSUP, -1;
+#else
+  struct uv__open_how how;
+  int tries;
+  int rc;
+
+  memset(&how, 0, sizeof(how));
+  how.flags = flags;
+#ifdef O_LARGEFILE
+  how.flags |= O_LARGEFILE;
+#endif
+  if (flags & O_CREAT)
+    how.mode = mode & 07777;
+#ifdef O_TMPFILE
+  if ((flags & O_TMPFILE) == O_TMPFILE)
+    how.mode = mode & 07777;
+#endif
+  how.resolve = UV__RESOLVE_BENEATH | UV__RESOLVE_NO_SYMLINKS;
+
+  /* EAGAIN: a rename raced the check that ".." stays beneath; retry. */
+  tries = 16;
+  do
+    rc = syscall(__NR_openat2, dirfd, path, &how, sizeof(how));
+  while (rc == -1 && errno == EAGAIN && --tries > 0);
+
+  if (rc == -1 && errno == ENOSYS)
+    errno = ENOTSUP;
 
   return rc;
 #endif
